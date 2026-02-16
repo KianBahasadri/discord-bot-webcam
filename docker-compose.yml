@@ -1,0 +1,8 @@
+services:
+  cam-bot:
+    build: .
+    environment:
+      - DISCORD_TOKEN
+    devices:
+      - "/dev/video0:/dev/video0"
+    restart: always
