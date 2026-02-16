@@ -6,7 +6,8 @@ Requirements
 - Docker (or Python 3.11+ if running locally)
 
 Environment
-- DISCORD_TOKEN: your bot token. Required.
+- Create a `.env` file in the project root with:
+  `DISCORD_TOKEN=your_bot_token_here`
 
 Build and run with Docker
 
@@ -14,9 +15,9 @@ Build and run with Docker
    docker build -t discord-cam-bot .
 
 2. Run the container (ensure your host webcam is available at /dev/video0):
-   docker run --rm -e DISCORD_TOKEN="$DISCORD_TOKEN" --device /dev/video0:/dev/video0 discord-cam-bot
+   docker run --rm --env-file .env --device /dev/video0:/dev/video0 discord-cam-bot
 
-OR use docker-compose (set DISCORD_TOKEN in your environment):
+OR use docker-compose (it loads `.env` automatically):
    docker compose up --build
 
 Notes
