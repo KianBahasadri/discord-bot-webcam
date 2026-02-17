@@ -13,7 +13,7 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py ./
+COPY bot.py ragebait_helpers.py ./
 
 # Run as root to allow access to /dev/video0 by default. If you prefer non-root,
 # drop privileges and ensure the container user has permission to access the device.
