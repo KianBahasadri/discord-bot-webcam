@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py ragebait_helpers.py ./
 
-# Run as root to allow access to /dev/video0 by default. If you prefer non-root,
-# drop privileges and ensure the container user has permission to access the device.
+# Run as root to allow access to /dev/video0 and /dev/video2 by default. If you
+# prefer non-root, drop privileges and ensure the container user has permission
+# to access those devices.
 CMD ["python", "bot.py"]

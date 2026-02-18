@@ -10,6 +10,8 @@ import tempfile
 import logging
 import re
 import json
+import time
+from typing import Optional
 
 import discord
 import asyncio
@@ -52,6 +54,75 @@ class CamBot(discord.Client):
 client = CamBot()
 
 
+def _read_stable_frame(cap: "cv2.VideoCapture", warmup_reads: int = 10, delay_s: float = 0.05):
+    """Read a usable frame, skipping initial green placeholder frames some devices emit."""
+    last_frame = None
+    for i in range(max(1, warmup_reads)):
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(delay_s)
+            continue
+
+        last_frame = frame
+        try:
+            # Some HDMI capture cards output an initial solid green frame while warming up.
+            mean_bgr = frame.mean(axis=(0, 1))
+            std_bgr = frame.std(axis=(0, 1))
+            looks_uniform = float(std_bgr.max()) < 2.0
+            looks_green = mean_bgr[1] > 80 and mean_bgr[0] < 20 and mean_bgr[2] < 20
+            if looks_uniform and looks_green and i < warmup_reads - 1:
+                time.sleep(delay_s)
+                continue
+        except Exception:
+            # If frame analysis fails, keep the frame and continue normally.
+            pass
+
+        if i < warmup_reads - 1:
+            time.sleep(delay_s)
+
+    return last_frame
+
+
+def _configure_hdmi_capture(cap: "cv2.VideoCapture"):
+    """Prefer a widescreen HDMI mode so screenshots are not squashed."""
+    try:
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+
+    try:
+        mjpg = cv2.VideoWriter_fourcc(*"MJPG")
+        cap.set(cv2.CAP_PROP_FOURCC, mjpg)
+    except Exception:
+        pass
+
+    preferred_modes = [
+        (1920, 1080),
+        (1280, 720),
+        (1600, 900),
+    ]
+    for width, height in preferred_modes:
+        try:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, float(width))
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, float(height))
+            time.sleep(0.05)
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            if actual_w == width and actual_h == height:
+                logger.info("Configured HDMI capture resolution to %sx%s", actual_w, actual_h)
+                return
+        except Exception:
+            continue
+
+    try:
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        logger.info("Using HDMI capture default resolution %sx%s", actual_w, actual_h)
+    except Exception:
+        pass
+
+
 @client.tree.command(name="webcam", description="Take a picture from kian's laptop webcam")
 async def webcam(interaction: discord.Interaction):
     """Slash command handler: capture and send one JPEG from /dev/video0."""
@@ -76,8 +147,8 @@ async def webcam(interaction: discord.Interaction):
         if not cap.isOpened():
             raise RuntimeError("Could not open video device /dev/video0 (or index 0). Ensure /dev/video0 is passed into the container and allowed.")
 
-        ret, frame = cap.read()
-        if not ret or frame is None:
+        frame = _read_stable_frame(cap)
+        if frame is None:
             raise RuntimeError("Failed to read frame from camera.")
         # Burn a timestamp into the image (Eastern timezone)
         try:
@@ -155,22 +226,162 @@ async def webcam(interaction: discord.Interaction):
                 logger.exception("Error removing temporary file: %s", tmp_path)
 
 
+@client.tree.command(name="screenshot", description="Take a picture from kian's tv monitor")
+async def screenshot(interaction: discord.Interaction):
+    """Slash command handler: capture and send one JPEG from /dev/video2."""
+    await interaction.response.defer()
+    tmp_path = None
+    cap = None
+    try:
+        # Try to open the HDMI capture device. Prefer /dev/video2, fallback to index 2.
+        if hasattr(cv2, "CAP_V4L2"):
+            cap = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)
+        else:
+            cap = cv2.VideoCapture("/dev/video2")
+
+        if not cap.isOpened():
+            # fallback to device index 2
+            try:
+                cap.release()
+            except Exception:
+                pass
+            cap = cv2.VideoCapture(2)
+
+        if not cap.isOpened():
+            raise RuntimeError("Could not open video device /dev/video2 (or index 2). Ensure /dev/video2 is passed into the container and allowed.")
+
+        _configure_hdmi_capture(cap)
+
+        frame = _read_stable_frame(cap)
+        if frame is None:
+            raise RuntimeError("Failed to read frame from HDMI capture card.")
+
+        # Burn a timestamp into the image (Eastern timezone)
+        try:
+            try:
+                now = datetime.now(ZoneInfo("America/New_York"))
+            except ZoneInfoNotFoundError:
+                logger.exception("IANA timezone data unavailable; falling back to UTC.")
+                now = datetime.utcnow()
+            timestamp = now.strftime("%Y-%m-%d %-I:%M:%S %p")
+
+            # Determine text size/placement
+            h, w = frame.shape[:2]
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            # Scale font relative to image size
+            font_scale = max(0.6, min(w, h) / 1000.0)
+            thickness = max(1, int(round(font_scale * 2)))
+            (text_w, text_h), baseline = cv2.getTextSize(timestamp, font, font_scale, thickness)
+
+            pad = int(round(min(w, h) * 0.02))  # padding from edges
+            rect_pad = int(round(min(w, h) * 0.01))
+
+            x = w - text_w - pad
+            y = h - pad
+
+            # Rectangle behind text (translucent)
+            rect_tl = (max(0, x - rect_pad), max(0, y - text_h - rect_pad - baseline))
+            rect_br = (min(w, x + text_w + rect_pad), min(h, y + rect_pad))
+
+            overlay = frame.copy()
+            cv2.rectangle(overlay, rect_tl, rect_br, (0, 0, 0), thickness=-1)
+            alpha = 0.5
+            # blend the rectangle onto the image
+            frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+            # Draw text with a thin black outline for extra contrast
+            cv2.putText(frame, timestamp, (x, y), font, font_scale, (0, 0, 0), thickness=thickness + 2, lineType=cv2.LINE_AA)
+            cv2.putText(frame, timestamp, (x, y), font, font_scale, (255, 255, 255), thickness=thickness, lineType=cv2.LINE_AA)
+        except Exception:
+            # If timestamping fails for any reason, continue without overlay
+            logger.exception("Failed to burn timestamp into image. Proceeding without timestamp.")
+
+        # Write to a temporary JPEG file
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        ok = cv2.imwrite(tmp_path, frame)
+        if not ok:
+            raise RuntimeError("Failed to write image to temporary file.")
+
+        # Send the image with no caption
+        await interaction.followup.send(file=discord.File(tmp_path))
+
+    except Exception as exc:
+        logger.exception("Error during /screenshot")
+        # Attempt to send an ephemeral error message to the user
+        try:
+            await interaction.followup.send(f"Error capturing image: {exc}", ephemeral=True)
+        except Exception:
+            # If followup fails, try response (may already be deferred)
+            try:
+                await interaction.response.send_message(f"Error capturing image: {exc}", ephemeral=True)
+            except Exception:
+                logger.exception("Failed to deliver error message to user.")
+    finally:
+        # Release camera and remove temporary file
+        try:
+            if cap is not None:
+                cap.release()
+        except Exception:
+            logger.exception("Error releasing camera.")
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                logger.exception("Error removing temporary file: %s", tmp_path)
+
+
 @client.tree.command(name="ragebait-mo", description="Ragebait Mohammad Sarhat and show the proof")
-async def ragebait_mo(interaction: discord.Interaction):
+async def ragebait_mo(interaction: discord.Interaction, phone: Optional[str] = None):
     """Slash command handler: extract topic from Mo's recent messages and run helper-driven flow."""
     await interaction.response.defer()
     try:
-        required_env_vars = [
+        # Allow an optional per-invocation phone override. If provided, MO_CELL_NUMBER is not required.
+        def _sanitize_phone_input(raw: Optional[str]) -> Optional[str]:
+            if not raw:
+                return None
+            s = raw.strip()
+            # strip common separators and tel: prefix
+            s = re.sub(r"[ \-\(\)\.]", "", s)
+            s = re.sub(r"^tel:", "", s, flags=re.I)
+            # normalize digits and leading +
+            if s.count("+") > 1:
+                return None
+            if not s.startswith("+"):
+                digits = re.sub(r"\D", "", s)
+                s = "+" + digits
+            else:
+                s = "+" + re.sub(r"\D", "", s[1:])
+            # E.164-ish validation: + followed by 2-15 digits, not starting with 0
+            if re.match(r"^\+[1-9]\d{1,14}$", s):
+                return s
+            return None
+
+        phone_override = None
+        if phone is not None:
+            phone_override = _sanitize_phone_input(phone)
+            if phone_override is None:
+                await interaction.followup.send(
+                    "Invalid phone number provided. Please supply an E.164-style number like +15555555555 or just digits.",
+                    ephemeral=True,
+                )
+                return
+
+        base_required = [
             "MO_USER_ID",
             "ELEVENLABS_API_KEY",
             "ELEVENLABS_AGENT_ID",
             "ELEVENLABS_AGENT_PHONE_NUMBER_ID",
-            "MO_CELL_NUMBER",
             "AZURE_OPENAI_ENDPOINT",
             "AZURE_OPENAI_API_KEY",
             "AZURE_OPENAI_DEPLOYMENT",
             "AZURE_OPENAI_API_VERSION",
         ]
+        required_env_vars = list(base_required)
+        if not phone_override:
+            required_env_vars.append("MO_CELL_NUMBER")
+
         missing = [name for name in required_env_vars if not os.environ.get(name)]
         if missing:
             await interaction.followup.send(
@@ -195,6 +406,7 @@ async def ragebait_mo(interaction: discord.Interaction):
                 start_elevenlabs_call,
                 poll_conversation_until_terminal,
                 format_transcript,
+                fetch_conversation_audio_with_retry,
             )
         except Exception as exc:
             logger.exception("Failed to import ragebait_helpers in /ragebait-mo")
@@ -241,16 +453,21 @@ async def ragebait_mo(interaction: discord.Interaction):
         try:
             dynamic_topic = await asyncio.to_thread(generate_topic_with_azure, prompt_text, "Mo recent conversation")
         except Exception as exc:
+            # Do not hard-fail if topic generation errors; log and continue with a
+            # sensible fallback topic string so the command can proceed.
             logger.exception("generate_topic_with_azure failed")
-            await interaction.followup.send(f"Failed to generate topic: {exc}", ephemeral=True)
-            return
+            dynamic_topic = "Mo recent conversation"
+            await interaction.followup.send("Failed to generate dynamic topic via Azure; using fallback topic.", ephemeral=False)
 
         await interaction.followup.send(f"Generated topic: {dynamic_topic}", ephemeral=False)
 
         # Start ElevenLabs agent call
         await interaction.followup.send("Starting ElevenLabs agent call...", ephemeral=False)
         try:
-            start_resp = await asyncio.to_thread(start_elevenlabs_call, dynamic_topic)
+            effective_to = phone_override if phone_override else os.environ.get("MO_CELL_NUMBER")
+            start_resp = await asyncio.to_thread(
+                start_elevenlabs_call, dynamic_topic, override_to_number=effective_to
+            )
         except Exception as exc:
             logger.exception("start_elevenlabs_call failed")
             await interaction.followup.send(f"Failed to start ElevenLabs call: {exc}", ephemeral=True)
@@ -368,9 +585,45 @@ async def ragebait_mo(interaction: discord.Interaction):
             await interaction.followup.send("Transcript is empty.", ephemeral=True)
             return
 
+        # Attempt to download the conversation audio from the documented
+        # ElevenLabs endpoint and upload it to Discord so we can include a
+        # stable recording URL in the final transcript. Failure here should
+        # not abort the command; we continue without a recording link.
+        audio_url = None
+        try:
+            # Download audio bytes with bounded retry policy (run in thread to avoid blocking)
+            audio_bytes, audio_ext = await asyncio.to_thread(fetch_conversation_audio_with_retry, str(conversation_id))
+            # Write to temp file and upload as attachment, capturing the message
+            tmp_audio = tempfile.NamedTemporaryFile(suffix=audio_ext or ".mp3", delete=False)
+            try:
+                tmp_audio.write(audio_bytes)
+                tmp_audio.flush()
+                tmp_audio.close()
+                # Send the audio as a followup attachment and wait for the message
+                msg_with_audio = await interaction.followup.send(file=discord.File(tmp_audio.name), wait=True)
+                if msg_with_audio and getattr(msg_with_audio, "attachments", None):
+                    audio_url = msg_with_audio.attachments[0].url
+            finally:
+                try:
+                    os.remove(tmp_audio.name)
+                except Exception:
+                    logger.exception("Failed to remove temporary audio file: %s", tmp_audio.name)
+        except Exception as exc:
+            # Distinguish expected transient "audio not ready" exhaustion from other errors.
+            msg = str(exc or "")
+            if isinstance(exc, RuntimeError) and msg.startswith("Exhausted retries fetching conversation audio"):
+                # Expected transient case: warn but do not log a noisy traceback.
+                logger.warning("Conversation audio unavailable after retries for %s: %s", conversation_id, msg)
+            else:
+                # Unexpected: log full exception with traceback for diagnostics
+                logger.exception("Failed to download or upload conversation audio; proceeding without recording link")
+
         # Deliver final transcript. If long, attach as a file
         if len(transcript_text) <= 1900:
-            await interaction.followup.send(f"Final transcript:\n\n{transcript_text}")
+            msg = f"Final transcript:\n\n{transcript_text}"
+            if audio_url:
+                msg += f"\n\nRecording: {audio_url}"
+            await interaction.followup.send(msg)
         else:
             tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
             tmp_path = tmp.name
@@ -378,7 +631,10 @@ async def ragebait_mo(interaction: discord.Interaction):
                 tmp.write(transcript_text.encode("utf-8"))
                 tmp.flush()
                 tmp.close()
-                await interaction.followup.send("Final transcript (attached):", file=discord.File(tmp_path))
+                header = "Final transcript (attached)."
+                if audio_url:
+                    header += f"\nRecording: {audio_url}"
+                await interaction.followup.send(header, file=discord.File(tmp_path))
             finally:
                 try:
                     os.remove(tmp_path)

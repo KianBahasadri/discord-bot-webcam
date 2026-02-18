@@ -5,4 +5,5 @@ services:
       - .env
     devices:
       - "/dev/video0:/dev/video0"
+      - "/dev/video2:/dev/video2"
     restart: always

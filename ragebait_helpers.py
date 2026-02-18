@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Dict, Optional
+import logging
 
 
 POLL_INTERVAL_SECONDS = 5
@@ -65,6 +66,79 @@ def _http_request(url: str, method: str = "GET", headers: Optional[Dict[str, str
         raise RuntimeError(f"HTTP {e.code} error for {url}: {err_text[:300]}")
     except Exception as e:
         raise RuntimeError(f"Request error for {url}: {e}")
+
+
+logger = logging.getLogger(__name__)
+
+
+def parse_http_error_info(exc: Exception) -> tuple[Optional[int], Optional[str]]:
+    """Extract HTTP status code and short body/text from common urllib/RuntimeError forms.
+
+    Returns (code, body_text) where either may be None if not available.
+    This helper is intentionally small and tolerant: it understands
+    urllib.error.HTTPError and RuntimeError messages produced by the
+    helpers in this module.
+    """
+    # urllib HTTPError: can read body directly
+    try:
+        if isinstance(exc, urllib.error.HTTPError):
+            code = getattr(exc, "code", None)
+            body = None
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                try:
+                    body = str(exc)
+                except Exception:
+                    body = None
+            return (int(code) if code is not None else None, body)
+    except Exception:
+        # fall through to other parsing
+        pass
+
+    # RuntimeError messages created by helpers often embed status and a
+    # short response snippet. Try to parse common patterns.
+    msg = None
+    try:
+        msg = str(exc)
+    except Exception:
+        msg = None
+
+    if not msg:
+        return (None, None)
+
+    # Common patterns:
+    #  - "HTTP {code} error for {url}: {err_text}"
+    #  - "... failed {code}: {text}"
+    import re
+
+    m = re.search(r"HTTP\s+(\d{3})", msg)
+    if not m:
+        m = re.search(r"failed\s+(\d{3})", msg, flags=re.I)
+    code = int(m.group(1)) if m else None
+
+    # Try to extract a short textual snippet after the status marker.
+    body = None
+    m_body = re.search(r"failed\s+\d{3}:\s*(.*)$", msg, flags=re.I)
+    if m_body:
+        body = m_body.group(1).strip()
+    elif " error for " in msg:
+        try:
+            tail = msg.split(" error for ", 1)[1]
+            if ": " in tail:
+                body = tail.split(": ", 1)[1].strip()
+            else:
+                body = tail.strip()
+        except Exception:
+            body = msg
+    else:
+        body = msg
+
+    # Clamp body length
+    if isinstance(body, str) and len(body) > 1000:
+        body = body[:1000]
+
+    return (code, body)
 
 
 def _find_json_substring(s: str) -> Optional[str]:
@@ -216,6 +290,21 @@ def generate_topic_with_azure(prompt_text: str, fallback: str) -> str:
             resp = None
 
     if isinstance(resp, dict):
+        # Some Azure wrappers place the actual response under a top-level
+        # `body` key (often a JSON string or dict). If present prefer that
+        # inner value for subsequent parsing to make extraction more robust.
+        if "body" in resp:
+            body_val = resp.get("body")
+            if isinstance(body_val, dict):
+                resp = body_val
+            elif isinstance(body_val, str):
+                try:
+                    parsed_body = json.loads(body_val)
+                    if isinstance(parsed_body, dict):
+                        resp = parsed_body
+                except Exception:
+                    # leave resp as-is but allow downstream fallbacks
+                    pass
         # get the model's text content from common response shapes
         content = None
         choices = resp.get("choices")
@@ -237,8 +326,13 @@ def generate_topic_with_azure(prompt_text: str, fallback: str) -> str:
                     content = resp.get(key)
                     break
 
-        # Use the robust extractor to turn the content into text
+        # Use the robust extractor to turn the content into text. If the
+        # normal content extraction fails, fall back to extracting from
+        # the whole response payload to catch atypical shapes.
         content_text = _extract_text_from_content(content)
+        if not content_text:
+            # Fall back to extracting any useful text from the full response
+            content_text = _extract_text_from_content(resp)
         if content_text:
             # content_text may itself be JSON or plain text
             try:
@@ -267,7 +361,7 @@ def generate_topic_with_azure(prompt_text: str, fallback: str) -> str:
     return topic
 
 
-def start_elevenlabs_call(dynamic_topic: str) -> dict:
+def start_elevenlabs_call(dynamic_topic: str, override_to_number: Optional[str] = None) -> dict:
     """Start an outbound ElevenLabs convai call (Twilio). Returns parsed JSON.
 
     The request will include DYNAMIC_TOPIC in the payload. Environment
@@ -275,15 +369,24 @@ def start_elevenlabs_call(dynamic_topic: str) -> dict:
       - ELEVENLABS_API_KEY
       - ELEVENLABS_AGENT_ID
       - ELEVENLABS_AGENT_PHONE_NUMBER_ID
-      - MO_CELL_NUMBER
+      - MO_CELL_NUMBER (unless override_to_number provided)
     """
     api_key = os.environ.get("ELEVENLABS_API_KEY")
     agent_id = os.environ.get("ELEVENLABS_AGENT_ID")
     phone_number_id = os.environ.get("ELEVENLABS_AGENT_PHONE_NUMBER_ID")
-    to_number = os.environ.get("MO_CELL_NUMBER")
+    to_number = override_to_number if override_to_number else os.environ.get("MO_CELL_NUMBER")
 
-    if not all([api_key, agent_id, phone_number_id, to_number]):
-        raise RuntimeError("Missing one of ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, ELEVENLABS_AGENT_PHONE_NUMBER_ID, MO_CELL_NUMBER env vars")
+    missing = []
+    if not api_key:
+        missing.append("ELEVENLABS_API_KEY")
+    if not agent_id:
+        missing.append("ELEVENLABS_AGENT_ID")
+    if not phone_number_id:
+        missing.append("ELEVENLABS_AGENT_PHONE_NUMBER_ID")
+    if not to_number:
+        missing.append("MO_CELL_NUMBER (or provide an override_to_number)")
+    if missing:
+        raise RuntimeError("Missing required ElevenLabs configuration: " + ", ".join(missing))
 
     url = "https://api.elevenlabs.io/v1/convai/twilio/outbound-call"
     # Use the documented ElevenLabs Twilio outbound payload shape. Keep the
@@ -310,6 +413,144 @@ def start_elevenlabs_call(dynamic_topic: str) -> dict:
         return json.loads(resp_text)
     except Exception:
         return {"raw_response": resp_text}
+
+
+def fetch_conversation_audio(conversation_id: str) -> tuple[bytes, str]:
+    """Download conversation audio bytes from ElevenLabs documented endpoint.
+
+    GET https://api.elevenlabs.io/v1/convai/conversations/{conversation_id}/audio
+
+    Returns (audio_bytes, file_ext) where file_ext includes the leading dot
+    (e.g. ".mp3", ".wav"). Raises RuntimeError on non-2xx or request errors.
+    """
+    api_key = os.environ.get("ELEVENLABS_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing ELEVENLABS_API_KEY env var")
+
+    quoted = urllib.parse.quote(conversation_id, safe="")
+    url = f"https://api.elevenlabs.io/v1/convai/conversations/{quoted}/audio"
+    req = urllib.request.Request(url, headers={"xi-api-key": api_key, "Accept": "*/*"}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            status = resp.getcode()
+            body = resp.read()
+            if not (200 <= status < 300):
+                # Try to include a short textual snippet for debugging
+                try:
+                    txt = body.decode("utf-8", errors="replace")
+                except Exception:
+                    txt = str(body)[:300]
+                raise RuntimeError(f"ElevenLabs audio download failed {status}: {txt[:300]}")
+
+            # Infer file extension from Content-Type when possible
+            ctype = ""
+            try:
+                ctype = resp.headers.get("Content-Type") or resp.headers.get("content-type") or ""
+            except Exception:
+                ctype = ""
+            ctype = (ctype or "").lower()
+            ext = ".mp3"
+            if "mpeg" in ctype or "mp3" in ctype:
+                ext = ".mp3"
+            elif "wav" in ctype:
+                ext = ".wav"
+            elif "ogg" in ctype:
+                ext = ".ogg"
+            elif "m4a" in ctype:
+                ext = ".m4a"
+            elif "flac" in ctype:
+                ext = ".flac"
+
+            return body, ext
+    except urllib.error.HTTPError as e:
+        try:
+            err_text = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_text = str(e)
+        raise RuntimeError(f"HTTP {e.code} error for {url}: {err_text[:300]}")
+    except Exception as e:
+        raise RuntimeError(f"Request error for {url}: {e}")
+
+
+def fetch_conversation_audio_with_retry(
+    conversation_id: str,
+    retry_interval_seconds: float = 3.0,
+    max_total_wait_seconds: float = 30.0,
+) -> tuple[bytes, str]:
+    """Attempt to fetch conversation audio with a bounded retry policy.
+
+    Default policy: immediate attempt, then retry every retry_interval_seconds
+    up to max_total_wait_seconds of total waiting time. Retries are only
+    attempted for the following cases:
+      - HTTP 404 where the response body indicates the audio is not yet
+        available (e.g. contains 'missing_conversation_audio' or similar)
+      - HTTP 429 (rate limit)
+      - 5xx server errors
+      - transient network/request errors (no HTTP code)
+
+    Non-retryable status codes: 400, 401, 403, 422
+
+    On success returns (audio_bytes, extension). On exhausted retries
+    raises RuntimeError with a concise message that includes the final
+    HTTP code when available.
+    """
+    start = time.time()
+    deadline = start + float(max_total_wait_seconds)
+    while True:
+        try:
+            return fetch_conversation_audio(conversation_id)
+        except Exception as e:
+            code, body = parse_http_error_info(e)
+
+            # classify retryable vs non-retryable
+            retryable = False
+            try:
+                if code is None:
+                    # network or other non-HTTP error; treat as transient
+                    retryable = True
+                else:
+                    if code == 404:
+                        # only retry for 404s that indicate audio not yet ready
+                        b = (body or "").lower()
+                        if (
+                            "missing_conversation_audio" in b
+                            or "missing conversation audio" in b
+                            or "audio not ready" in b
+                            or "audio not found" in b
+                            or "missing audio" in b
+                        ):
+                            retryable = True
+                    if code == 429:
+                        retryable = True
+                    if 500 <= int(code) < 600:
+                        retryable = True
+
+                    # explicit non-retryable cases
+                    if int(code) in (400, 401, 403, 422):
+                        retryable = False
+            except Exception:
+                # conservative default: do not retry
+                retryable = False
+
+            now = time.time()
+            if not retryable:
+                # non-retryable: re-raise the original exception
+                raise
+
+            # Check if we have time left to retry
+            if now >= deadline:
+                final_code = code or "none"
+                short_body = (body or "")[:300]
+                # include HTTP <code> pattern so callers can parse the code
+                msg = f"Exhausted retries fetching conversation audio {conversation_id}; final HTTP {final_code}"
+                if short_body:
+                    msg += f": {short_body}"
+                raise RuntimeError(msg)
+
+            # sleep a bounded interval then retry
+            sleep_for = min(float(retry_interval_seconds), max(0.0, deadline - now))
+            time.sleep(sleep_for)
+            continue
 
 
 def poll_conversation_until_terminal(conversation_id: str) -> dict:
