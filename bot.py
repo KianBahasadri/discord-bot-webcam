@@ -11,6 +11,7 @@ import logging
 import re
 import json
 import time
+import subprocess
 from typing import Optional
 
 import discord
@@ -83,6 +84,43 @@ def _read_stable_frame(cap: "cv2.VideoCapture", warmup_reads: int = 10, delay_s:
     return last_frame
 
 
+def _apply_timestamp_overlay(frame):
+    """Burn an Eastern-time timestamp into the frame."""
+    try:
+        try:
+            now = datetime.now(ZoneInfo("America/New_York"))
+        except ZoneInfoNotFoundError:
+            logger.exception("IANA timezone data unavailable; falling back to UTC.")
+            now = datetime.utcnow()
+        timestamp = now.strftime("%Y-%m-%d %-I:%M:%S %p")
+
+        h, w = frame.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = max(0.6, min(w, h) / 1000.0)
+        thickness = max(1, int(round(font_scale * 2)))
+        (text_w, text_h), baseline = cv2.getTextSize(timestamp, font, font_scale, thickness)
+
+        pad = int(round(min(w, h) * 0.02))
+        rect_pad = int(round(min(w, h) * 0.01))
+
+        x = w - text_w - pad
+        y = h - pad
+
+        rect_tl = (max(0, x - rect_pad), max(0, y - text_h - rect_pad - baseline))
+        rect_br = (min(w, x + text_w + rect_pad), min(h, y + rect_pad))
+
+        overlay = frame.copy()
+        cv2.rectangle(overlay, rect_tl, rect_br, (0, 0, 0), thickness=-1)
+        alpha = 0.5
+        frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+
+        cv2.putText(frame, timestamp, (x, y), font, font_scale, (0, 0, 0), thickness=thickness + 2, lineType=cv2.LINE_AA)
+        cv2.putText(frame, timestamp, (x, y), font, font_scale, (255, 255, 255), thickness=thickness, lineType=cv2.LINE_AA)
+    except Exception:
+        logger.exception("Failed to burn timestamp into image. Proceeding without timestamp.")
+    return frame
+
+
 def _configure_hdmi_capture(cap: "cv2.VideoCapture"):
     """Prefer a widescreen HDMI mode so screenshots are not squashed."""
     try:
@@ -123,12 +161,59 @@ def _configure_hdmi_capture(cap: "cv2.VideoCapture"):
         pass
 
 
-@client.tree.command(name="webcam", description="Take a picture from kian's laptop webcam")
+def _capture_remote_webcam_to_tempfile() -> str:
+    """Capture one frame from a remote laptop webcam over SSH and return local temp file path."""
+    ssh_target = os.environ.get("REMOTE_WEBCAM_SSH_TARGET", "root@laptop3")
+    remote_device = os.environ.get("REMOTE_WEBCAM_DEVICE", "/dev/video0")
+    remote_output = os.environ.get("REMOTE_WEBCAM_OUTPUT", "/tmp/discord-remote-webcam.jpg")
+    timeout_s = int(os.environ.get("REMOTE_WEBCAM_TIMEOUT_SECONDS", "12"))
+
+    remote_cmd = (
+        f"ffmpeg -f video4linux2 -i {remote_device} -frames:v 1 {remote_output} "
+        f"-y -loglevel error >/dev/null 2>&1 && cat {remote_output}"
+    )
+
+    proc = subprocess.run(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            ssh_target,
+            remote_cmd,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout_s,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Remote webcam capture failed via SSH ({ssh_target}): {stderr or 'unknown error'}")
+
+    img_bytes = proc.stdout or b""
+    if len(img_bytes) < 100:
+        raise RuntimeError(f"Remote webcam capture returned too little data from {ssh_target}.")
+
+    tmp = tempfile.NamedTemporaryFile(suffix="-remote.jpg", delete=False)
+    try:
+        tmp.write(img_bytes)
+        tmp.flush()
+    finally:
+        tmp.close()
+    return tmp.name
+
+
+@client.tree.command(name="webcam", description="idek wtf im doing anymore")
 async def webcam(interaction: discord.Interaction):
-    """Slash command handler: capture and send one JPEG from /dev/video0."""
+    """Slash command handler: capture local webcam, remote webcam, and HDMI screenshot."""
     await interaction.response.defer()
     tmp_path = None
+    remote_tmp_path = None
+    hdmi_tmp_path = None
     cap = None
+    hdmi_cap = None
     try:
         # Try to open the host device. Prefer /dev/video0, fallback to index 0.
         if hasattr(cv2, "CAP_V4L2"):
@@ -150,45 +235,7 @@ async def webcam(interaction: discord.Interaction):
         frame = _read_stable_frame(cap)
         if frame is None:
             raise RuntimeError("Failed to read frame from camera.")
-        # Burn a timestamp into the image (Eastern timezone)
-        try:
-            try:
-                now = datetime.now(ZoneInfo("America/New_York"))
-            except ZoneInfoNotFoundError:
-                logger.exception("IANA timezone data unavailable; falling back to UTC.")
-                now = datetime.utcnow()
-            timestamp = now.strftime("%Y-%m-%d %-I:%M:%S %p")
-
-            # Determine text size/placement
-            h, w = frame.shape[:2]
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            # Scale font relative to image size
-            font_scale = max(0.6, min(w, h) / 1000.0)
-            thickness = max(1, int(round(font_scale * 2)))
-            (text_w, text_h), baseline = cv2.getTextSize(timestamp, font, font_scale, thickness)
-
-            pad = int(round(min(w, h) * 0.02))  # padding from edges
-            rect_pad = int(round(min(w, h) * 0.01))
-
-            x = w - text_w - pad
-            y = h - pad
-
-            # Rectangle behind text (translucent)
-            rect_tl = (max(0, x - rect_pad), max(0, y - text_h - rect_pad - baseline))
-            rect_br = (min(w, x + text_w + rect_pad), min(h, y + rect_pad))
-
-            overlay = frame.copy()
-            cv2.rectangle(overlay, rect_tl, rect_br, (0, 0, 0), thickness=-1)
-            alpha = 0.5
-            # blend the rectangle onto the image
-            frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-
-            # Draw text with a thin black outline for extra contrast
-            cv2.putText(frame, timestamp, (x, y), font, font_scale, (0, 0, 0), thickness=thickness + 2, lineType=cv2.LINE_AA)
-            cv2.putText(frame, timestamp, (x, y), font, font_scale, (255, 255, 255), thickness=thickness, lineType=cv2.LINE_AA)
-        except Exception:
-            # If timestamping fails for any reason, continue without overlay
-            logger.exception("Failed to burn timestamp into image. Proceeding without timestamp.")
+        frame = _apply_timestamp_overlay(frame)
 
         # Write to a temporary JPEG file
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
@@ -198,8 +245,63 @@ async def webcam(interaction: discord.Interaction):
         if not ok:
             raise RuntimeError("Failed to write image to temporary file.")
 
-        # Send the image with no caption
-        await interaction.followup.send(file=discord.File(tmp_path))
+        # Best-effort remote laptop capture over SSH; local webcam still succeeds if this fails.
+        try:
+            remote_tmp_path = await asyncio.to_thread(_capture_remote_webcam_to_tempfile)
+            remote_frame = cv2.imread(remote_tmp_path)
+            if remote_frame is not None:
+                remote_frame = _apply_timestamp_overlay(remote_frame)
+                if not cv2.imwrite(remote_tmp_path, remote_frame):
+                    logger.warning("Failed to write timestamped remote webcam image; sending original remote frame.")
+            else:
+                logger.warning("Failed to decode remote webcam image for timestamping; sending original remote frame.")
+        except Exception as remote_exc:
+            logger.warning("Remote webcam capture unavailable for /webcam: %s", remote_exc)
+
+        # Best-effort HDMI screenshot capture; local webcam still succeeds if this fails.
+        try:
+            if hasattr(cv2, "CAP_V4L2"):
+                hdmi_cap = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)
+            else:
+                hdmi_cap = cv2.VideoCapture("/dev/video2")
+
+            if not hdmi_cap.isOpened():
+                try:
+                    hdmi_cap.release()
+                except Exception:
+                    pass
+                hdmi_cap = cv2.VideoCapture(2)
+
+            if not hdmi_cap.isOpened():
+                raise RuntimeError("Could not open video device /dev/video2 (or index 2).")
+
+            _configure_hdmi_capture(hdmi_cap)
+            hdmi_frame = _read_stable_frame(hdmi_cap)
+            if hdmi_frame is None:
+                raise RuntimeError("Failed to read frame from HDMI capture card.")
+
+            hdmi_frame = _apply_timestamp_overlay(hdmi_frame)
+            hdmi_tmp = tempfile.NamedTemporaryFile(suffix="-screenshot.jpg", delete=False)
+            hdmi_tmp_path = hdmi_tmp.name
+            hdmi_tmp.close()
+            if not cv2.imwrite(hdmi_tmp_path, hdmi_frame):
+                raise RuntimeError("Failed to write HDMI screenshot to temporary file.")
+        except Exception as hdmi_exc:
+            logger.warning("HDMI screenshot capture unavailable for /webcam: %s", hdmi_exc)
+        finally:
+            try:
+                if hdmi_cap is not None:
+                    hdmi_cap.release()
+            except Exception:
+                logger.exception("Error releasing HDMI capture device.")
+
+        files = [discord.File(tmp_path)]
+        if remote_tmp_path:
+            files.append(discord.File(remote_tmp_path))
+        if hdmi_tmp_path:
+            files.append(discord.File(hdmi_tmp_path))
+
+        await interaction.followup.send(files=files)
 
     except Exception as exc:
         logger.exception("Error during /webcam")
@@ -224,112 +326,16 @@ async def webcam(interaction: discord.Interaction):
                 os.remove(tmp_path)
             except Exception:
                 logger.exception("Error removing temporary file: %s", tmp_path)
-
-
-@client.tree.command(name="screenshot", description="Take a picture from kian's tv monitor")
-async def screenshot(interaction: discord.Interaction):
-    """Slash command handler: capture and send one JPEG from /dev/video2."""
-    await interaction.response.defer()
-    tmp_path = None
-    cap = None
-    try:
-        # Try to open the HDMI capture device. Prefer /dev/video2, fallback to index 2.
-        if hasattr(cv2, "CAP_V4L2"):
-            cap = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)
-        else:
-            cap = cv2.VideoCapture("/dev/video2")
-
-        if not cap.isOpened():
-            # fallback to device index 2
+        if remote_tmp_path:
             try:
-                cap.release()
+                os.remove(remote_tmp_path)
             except Exception:
-                pass
-            cap = cv2.VideoCapture(2)
-
-        if not cap.isOpened():
-            raise RuntimeError("Could not open video device /dev/video2 (or index 2). Ensure /dev/video2 is passed into the container and allowed.")
-
-        _configure_hdmi_capture(cap)
-
-        frame = _read_stable_frame(cap)
-        if frame is None:
-            raise RuntimeError("Failed to read frame from HDMI capture card.")
-
-        # Burn a timestamp into the image (Eastern timezone)
-        try:
+                logger.exception("Error removing temporary file: %s", remote_tmp_path)
+        if hdmi_tmp_path:
             try:
-                now = datetime.now(ZoneInfo("America/New_York"))
-            except ZoneInfoNotFoundError:
-                logger.exception("IANA timezone data unavailable; falling back to UTC.")
-                now = datetime.utcnow()
-            timestamp = now.strftime("%Y-%m-%d %-I:%M:%S %p")
-
-            # Determine text size/placement
-            h, w = frame.shape[:2]
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            # Scale font relative to image size
-            font_scale = max(0.6, min(w, h) / 1000.0)
-            thickness = max(1, int(round(font_scale * 2)))
-            (text_w, text_h), baseline = cv2.getTextSize(timestamp, font, font_scale, thickness)
-
-            pad = int(round(min(w, h) * 0.02))  # padding from edges
-            rect_pad = int(round(min(w, h) * 0.01))
-
-            x = w - text_w - pad
-            y = h - pad
-
-            # Rectangle behind text (translucent)
-            rect_tl = (max(0, x - rect_pad), max(0, y - text_h - rect_pad - baseline))
-            rect_br = (min(w, x + text_w + rect_pad), min(h, y + rect_pad))
-
-            overlay = frame.copy()
-            cv2.rectangle(overlay, rect_tl, rect_br, (0, 0, 0), thickness=-1)
-            alpha = 0.5
-            # blend the rectangle onto the image
-            frame = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
-
-            # Draw text with a thin black outline for extra contrast
-            cv2.putText(frame, timestamp, (x, y), font, font_scale, (0, 0, 0), thickness=thickness + 2, lineType=cv2.LINE_AA)
-            cv2.putText(frame, timestamp, (x, y), font, font_scale, (255, 255, 255), thickness=thickness, lineType=cv2.LINE_AA)
-        except Exception:
-            # If timestamping fails for any reason, continue without overlay
-            logger.exception("Failed to burn timestamp into image. Proceeding without timestamp.")
-
-        # Write to a temporary JPEG file
-        tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        ok = cv2.imwrite(tmp_path, frame)
-        if not ok:
-            raise RuntimeError("Failed to write image to temporary file.")
-
-        # Send the image with no caption
-        await interaction.followup.send(file=discord.File(tmp_path))
-
-    except Exception as exc:
-        logger.exception("Error during /screenshot")
-        # Attempt to send an ephemeral error message to the user
-        try:
-            await interaction.followup.send(f"Error capturing image: {exc}", ephemeral=True)
-        except Exception:
-            # If followup fails, try response (may already be deferred)
-            try:
-                await interaction.response.send_message(f"Error capturing image: {exc}", ephemeral=True)
+                os.remove(hdmi_tmp_path)
             except Exception:
-                logger.exception("Failed to deliver error message to user.")
-    finally:
-        # Release camera and remove temporary file
-        try:
-            if cap is not None:
-                cap.release()
-        except Exception:
-            logger.exception("Error releasing camera.")
-        if tmp_path:
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                logger.exception("Error removing temporary file: %s", tmp_path)
+                logger.exception("Error removing temporary file: %s", hdmi_tmp_path)
 
 
 @client.tree.command(name="ragebait-mo", description="Ragebait Mohammad Sarhat and show the proof")
