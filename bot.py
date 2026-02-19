@@ -12,7 +12,8 @@ import re
 import json
 import time
 import subprocess
-from typing import Optional
+import shlex
+from typing import Callable, Optional
 
 import discord
 import asyncio
@@ -167,27 +168,56 @@ def _capture_remote_webcam_to_tempfile() -> str:
     remote_device = os.environ.get("REMOTE_WEBCAM_DEVICE", "/dev/video0")
     remote_output = os.environ.get("REMOTE_WEBCAM_OUTPUT", "/tmp/discord-remote-webcam.jpg")
     timeout_s = int(os.environ.get("REMOTE_WEBCAM_TIMEOUT_SECONDS", "12"))
+    warmup_frames = int(os.environ.get("REMOTE_WEBCAM_WARMUP_FRAMES", "30"))
+    warmup_fps = int(os.environ.get("REMOTE_WEBCAM_WARMUP_FPS", "15"))
+    settle_seconds = float(os.environ.get("REMOTE_WEBCAM_SETTLE_SECONDS", "0.4"))
 
-    remote_cmd = (
-        f"ffmpeg -f video4linux2 -i {remote_device} -frames:v 1 {remote_output} "
-        f"-y -loglevel error >/dev/null 2>&1 && cat {remote_output}"
+    if warmup_frames < 0:
+        warmup_frames = 0
+    if warmup_fps < 1:
+        warmup_fps = 1
+    if settle_seconds < 0:
+        settle_seconds = 0.0
+
+    remote_device_q = shlex.quote(remote_device)
+    remote_output_q = shlex.quote(remote_output)
+
+    warmup_cmd = ""
+    if warmup_frames > 0:
+        warmup_cmd = (
+            f"ffmpeg -f video4linux2 -framerate {warmup_fps} -i {remote_device_q} "
+            f"-frames:v {warmup_frames} -f null - -loglevel error >/dev/null 2>&1"
+        )
+
+    capture_cmd = (
+        f"ffmpeg -f video4linux2 -i {remote_device_q} -frames:v 1 {remote_output_q} "
+        f"-y -loglevel error >/dev/null 2>&1 && cat {remote_output_q}"
     )
 
-    proc = subprocess.run(
-        [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            ssh_target,
-            remote_cmd,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout_s,
-        check=False,
-    )
+    if warmup_cmd:
+        remote_cmd = f"{warmup_cmd} && sleep {settle_seconds:.3f} && {capture_cmd}"
+    else:
+        remote_cmd = capture_cmd
+
+    try:
+        proc = subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                ssh_target,
+                remote_cmd,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"Remote webcam capture timed out after {timeout_s}s via SSH ({ssh_target}).") from exc
+
     if proc.returncode != 0:
         stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"Remote webcam capture failed via SSH ({ssh_target}): {stderr or 'unknown error'}")
@@ -202,27 +232,28 @@ def _capture_remote_webcam_to_tempfile() -> str:
         tmp.flush()
     finally:
         tmp.close()
+
+    remote_frame = cv2.imread(tmp.name)
+    if remote_frame is not None:
+        remote_frame = _apply_timestamp_overlay(remote_frame)
+        if not cv2.imwrite(tmp.name, remote_frame):
+            logger.warning("Failed to write timestamped remote webcam image; sending original remote frame.")
+    else:
+        logger.warning("Failed to decode remote webcam image for timestamping; sending original remote frame.")
+
     return tmp.name
 
 
-@client.tree.command(name="webcam", description="idek wtf im doing anymore")
-async def webcam(interaction: discord.Interaction):
-    """Slash command handler: capture local webcam, remote webcam, and HDMI screenshot."""
-    await interaction.response.defer()
-    tmp_path = None
-    remote_tmp_path = None
-    hdmi_tmp_path = None
+def _capture_local_webcam_to_tempfile() -> str:
+    """Capture one frame from the host webcam and return local temp file path."""
     cap = None
-    hdmi_cap = None
     try:
-        # Try to open the host device. Prefer /dev/video0, fallback to index 0.
         if hasattr(cv2, "CAP_V4L2"):
             cap = cv2.VideoCapture("/dev/video0", cv2.CAP_V4L2)
         else:
             cap = cv2.VideoCapture("/dev/video0")
 
         if not cap.isOpened():
-            # fallback to device index 0
             try:
                 cap.release()
             except Exception:
@@ -230,78 +261,123 @@ async def webcam(interaction: discord.Interaction):
             cap = cv2.VideoCapture(0)
 
         if not cap.isOpened():
-            raise RuntimeError("Could not open video device /dev/video0 (or index 0). Ensure /dev/video0 is passed into the container and allowed.")
+            raise RuntimeError(
+                "Could not open video device /dev/video0 (or index 0). "
+                "Ensure /dev/video0 is passed into the container and allowed."
+            )
 
         frame = _read_stable_frame(cap)
         if frame is None:
             raise RuntimeError("Failed to read frame from camera.")
-        frame = _apply_timestamp_overlay(frame)
 
-        # Write to a temporary JPEG file
+        frame = _apply_timestamp_overlay(frame)
         tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
         tmp_path = tmp.name
         tmp.close()
-        ok = cv2.imwrite(tmp_path, frame)
-        if not ok:
+        if not cv2.imwrite(tmp_path, frame):
             raise RuntimeError("Failed to write image to temporary file.")
 
-        # Best-effort remote laptop capture over SSH; local webcam still succeeds if this fails.
+        return tmp_path
+    finally:
         try:
-            remote_tmp_path = await asyncio.to_thread(_capture_remote_webcam_to_tempfile)
-            remote_frame = cv2.imread(remote_tmp_path)
-            if remote_frame is not None:
-                remote_frame = _apply_timestamp_overlay(remote_frame)
-                if not cv2.imwrite(remote_tmp_path, remote_frame):
-                    logger.warning("Failed to write timestamped remote webcam image; sending original remote frame.")
-            else:
-                logger.warning("Failed to decode remote webcam image for timestamping; sending original remote frame.")
-        except Exception as remote_exc:
-            logger.warning("Remote webcam capture unavailable for /webcam: %s", remote_exc)
+            if cap is not None:
+                cap.release()
+        except Exception:
+            logger.exception("Error releasing camera.")
 
-        # Best-effort HDMI screenshot capture; local webcam still succeeds if this fails.
-        try:
-            if hasattr(cv2, "CAP_V4L2"):
-                hdmi_cap = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)
-            else:
-                hdmi_cap = cv2.VideoCapture("/dev/video2")
 
-            if not hdmi_cap.isOpened():
-                try:
-                    hdmi_cap.release()
-                except Exception:
-                    pass
-                hdmi_cap = cv2.VideoCapture(2)
+def _capture_hdmi_screenshot_to_tempfile() -> str:
+    """Capture one frame from HDMI capture card and return local temp file path."""
+    hdmi_cap = None
+    try:
+        if hasattr(cv2, "CAP_V4L2"):
+            hdmi_cap = cv2.VideoCapture("/dev/video2", cv2.CAP_V4L2)
+        else:
+            hdmi_cap = cv2.VideoCapture("/dev/video2")
 
-            if not hdmi_cap.isOpened():
-                raise RuntimeError("Could not open video device /dev/video2 (or index 2).")
-
-            _configure_hdmi_capture(hdmi_cap)
-            hdmi_frame = _read_stable_frame(hdmi_cap)
-            if hdmi_frame is None:
-                raise RuntimeError("Failed to read frame from HDMI capture card.")
-
-            hdmi_frame = _apply_timestamp_overlay(hdmi_frame)
-            hdmi_tmp = tempfile.NamedTemporaryFile(suffix="-screenshot.jpg", delete=False)
-            hdmi_tmp_path = hdmi_tmp.name
-            hdmi_tmp.close()
-            if not cv2.imwrite(hdmi_tmp_path, hdmi_frame):
-                raise RuntimeError("Failed to write HDMI screenshot to temporary file.")
-        except Exception as hdmi_exc:
-            logger.warning("HDMI screenshot capture unavailable for /webcam: %s", hdmi_exc)
-        finally:
+        if not hdmi_cap.isOpened():
             try:
-                if hdmi_cap is not None:
-                    hdmi_cap.release()
+                hdmi_cap.release()
             except Exception:
-                logger.exception("Error releasing HDMI capture device.")
+                pass
+            hdmi_cap = cv2.VideoCapture(2)
 
-        files = [discord.File(tmp_path)]
-        if remote_tmp_path:
-            files.append(discord.File(remote_tmp_path))
-        if hdmi_tmp_path:
-            files.append(discord.File(hdmi_tmp_path))
+        if not hdmi_cap.isOpened():
+            raise RuntimeError("Could not open video device /dev/video2 (or index 2).")
 
-        await interaction.followup.send(files=files)
+        _configure_hdmi_capture(hdmi_cap)
+        hdmi_frame = _read_stable_frame(hdmi_cap)
+        if hdmi_frame is None:
+            raise RuntimeError("Failed to read frame from HDMI capture card.")
+
+        hdmi_frame = _apply_timestamp_overlay(hdmi_frame)
+        hdmi_tmp = tempfile.NamedTemporaryFile(suffix="-screenshot.jpg", delete=False)
+        hdmi_tmp_path = hdmi_tmp.name
+        hdmi_tmp.close()
+        if not cv2.imwrite(hdmi_tmp_path, hdmi_frame):
+            raise RuntimeError("Failed to write HDMI screenshot to temporary file.")
+
+        return hdmi_tmp_path
+    finally:
+        try:
+            if hdmi_cap is not None:
+                hdmi_cap.release()
+        except Exception:
+            logger.exception("Error releasing HDMI capture device.")
+
+
+async def _run_capture_job(name: str, capture_fn: Callable[[], str], timeout_s: int) -> dict:
+    """Run one capture in background and normalize success/error shape."""
+    try:
+        path = await asyncio.wait_for(asyncio.to_thread(capture_fn), timeout=timeout_s)
+        return {"name": name, "path": path, "error": None}
+    except asyncio.TimeoutError:
+        return {"name": name, "path": None, "error": f"{name} capture timed out after {timeout_s}s."}
+    except Exception as exc:
+        logger.warning("%s capture failed for /webcam: %s", name, exc)
+        msg = str(exc).strip() or f"{name} capture failed."
+        return {"name": name, "path": None, "error": msg}
+
+
+@client.tree.command(name="webcam", description="idek wtf im doing anymore")
+async def webcam(interaction: discord.Interaction):
+    """Slash command handler: capture local webcam, remote webcam, and HDMI screenshot."""
+    await interaction.response.defer()
+    tmp_paths = []
+    try:
+        timeout_s = int(os.environ.get("WEBCAM_CAPTURE_TIMEOUT_SECONDS", "20"))
+        capture_jobs = [
+            _run_capture_job("Local webcam", _capture_local_webcam_to_tempfile, timeout_s),
+            _run_capture_job("Remote webcam", _capture_remote_webcam_to_tempfile, timeout_s),
+            _run_capture_job("HDMI screenshot", _capture_hdmi_screenshot_to_tempfile, timeout_s),
+        ]
+        results = await asyncio.gather(*capture_jobs)
+
+        files = []
+        errors = []
+        for result in results:
+            path = result.get("path")
+            if path:
+                tmp_paths.append(path)
+                files.append(discord.File(path))
+            if result.get("error"):
+                errors.append(result["error"])
+
+        if not files and errors:
+            await interaction.followup.send("Webcam captures failed:\n" + "\n".join(f"- {err}" for err in errors))
+            return
+
+        content = None
+        if errors:
+            content = "Some captures failed:\n" + "\n".join(f"- {err}" for err in errors)
+
+        if files:
+            if content is None:
+                await interaction.followup.send(files=files)
+            else:
+                await interaction.followup.send(content=content, files=files)
+        else:
+            await interaction.followup.send(content or "No captures produced output.")
 
     except Exception as exc:
         logger.exception("Error during /webcam")
@@ -315,27 +391,11 @@ async def webcam(interaction: discord.Interaction):
             except Exception:
                 logger.exception("Failed to deliver error message to user.")
     finally:
-        # Release camera and remove temporary file
-        try:
-            if cap is not None:
-                cap.release()
-        except Exception:
-            logger.exception("Error releasing camera.")
-        if tmp_path:
+        for tmp_path in tmp_paths:
             try:
                 os.remove(tmp_path)
             except Exception:
                 logger.exception("Error removing temporary file: %s", tmp_path)
-        if remote_tmp_path:
-            try:
-                os.remove(remote_tmp_path)
-            except Exception:
-                logger.exception("Error removing temporary file: %s", remote_tmp_path)
-        if hdmi_tmp_path:
-            try:
-                os.remove(hdmi_tmp_path)
-            except Exception:
-                logger.exception("Error removing temporary file: %s", hdmi_tmp_path)
 
 
 @client.tree.command(name="ragebait-mo", description="Ragebait Mohammad Sarhat and show the proof")
