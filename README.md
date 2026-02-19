@@ -8,6 +8,18 @@ Requirements
 Environment
 - Create a `.env` file in the project root with at least:
   `DISCORD_TOKEN=your_bot_token_here`
+- For `/webcam` redaction, also set:
+  `OPENROUTER_API_KEY`
+- Optional `/webcam` redaction tuning env vars:
+  `OPENROUTER_REDACTION_MODEL` (default `google/gemini-2.5-flash`; falls back to `OPENROUTER_MODEL`),
+  `OPENROUTER_SITE_URL` (default `http://localhost`),
+  `OPENROUTER_APP_NAME` (default `discord-webcam-redaction`),
+  `WEBCAM_REDACTION_TIMEOUT_SECONDS` (default `30`),
+  `WEBCAM_REDACTION_MAX_SIDE` (default `1280`),
+  `WEBCAM_REDACTION_PADDING_RATIO` (default `0.08`),
+  `WEBCAM_REDACTION_MIN_BOX_SIDE` (default `12`),
+  `WEBCAM_REDACTION_PROTECT_TIMESTAMP` (default `true`; ignores bottom-right timestamp strip),
+  `WEBCAM_REDACTION_FAIL_CLOSED` (default `true`; if enabled, full-frame blur is used on model failure)
 - For `/ragebait-mo`, also set:
   `MO_USER_ID`, `ELEVENLABS_API_KEY`, `ELEVENLABS_AGENT_ID`, `ELEVENLABS_AGENT_PHONE_NUMBER_ID`, `MO_CELL_NUMBER`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`
 
@@ -28,4 +40,5 @@ Notes
 - The bot registers global slash commands on startup (`/webcam`, `/ragebait-mo`). It may take a few minutes to appear in all guilds.
 - The bot uses opencv-python-headless to capture a single frame and sends it as a JPEG with no caption.
 - `/webcam` captures from `/dev/video0` (laptop webcam), attempts a remote webcam capture over SSH, and captures from `/dev/video2` (HDMI capture card).
+- `/webcam` redacts each captured image before upload by blurring detected explicit content and visible PII (for example: phone numbers, API keys/tokens, and credit card numbers).
 - Errors (camera not available, failed capture, missing token) are sent as ephemeral messages to the invoking user.

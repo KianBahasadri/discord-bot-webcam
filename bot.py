@@ -18,6 +18,7 @@ from typing import Callable, Optional
 import discord
 import asyncio
 from discord import app_commands
+from media_redaction import redact_sensitive_media_inplace
 
 try:
     import cv2
@@ -339,6 +340,27 @@ async def _run_capture_job(name: str, capture_fn: Callable[[], str], timeout_s: 
         return {"name": name, "path": None, "error": msg}
 
 
+async def _run_redaction_job(name: str, path: str, timeout_s: int) -> dict:
+    """Run one image redaction in background and normalize success/error shape."""
+    try:
+        metadata = await asyncio.wait_for(
+            asyncio.to_thread(redact_sensitive_media_inplace, path),
+            timeout=timeout_s,
+        )
+        return {"name": name, "path": path, "error": None, "metadata": metadata}
+    except asyncio.TimeoutError:
+        return {
+            "name": name,
+            "path": None,
+            "error": f"{name} redaction timed out after {timeout_s}s.",
+            "metadata": None,
+        }
+    except Exception as exc:
+        logger.warning("%s redaction failed for /webcam: %s", name, exc)
+        msg = str(exc).strip() or f"{name} redaction failed."
+        return {"name": name, "path": None, "error": msg, "metadata": None}
+
+
 @client.tree.command(name="webcam", description="idek wtf im doing anymore")
 async def webcam(interaction: discord.Interaction):
     """Slash command handler: capture local webcam, remote webcam, and HDMI screenshot."""
@@ -353,15 +375,39 @@ async def webcam(interaction: discord.Interaction):
         ]
         results = await asyncio.gather(*capture_jobs)
 
+        redaction_timeout_s = int(os.environ.get("WEBCAM_REDACTION_TIMEOUT_SECONDS", "30"))
+        redaction_inputs = []
+
         files = []
         errors = []
+        notes = []
         for result in results:
             path = result.get("path")
             if path:
                 tmp_paths.append(path)
-                files.append(discord.File(path))
+                redaction_inputs.append({"name": result.get("name", "capture"), "path": path})
             if result.get("error"):
                 errors.append(result["error"])
+
+        if redaction_inputs:
+            redaction_jobs = [
+                _run_redaction_job(item["name"], item["path"], redaction_timeout_s)
+                for item in redaction_inputs
+            ]
+            redaction_results = await asyncio.gather(*redaction_jobs)
+
+            for redaction_result in redaction_results:
+                if redaction_result.get("error"):
+                    errors.append(redaction_result["error"])
+                    continue
+
+                redacted_path = redaction_result.get("path")
+                if redacted_path:
+                    files.append(discord.File(redacted_path))
+
+                metadata = redaction_result.get("metadata") or {}
+                if metadata.get("full_blur"):
+                    notes.append(f"{redaction_result.get('name', 'Capture')}: full-frame blur fallback applied.")
 
         if not files and errors:
             await interaction.followup.send("Webcam captures failed:\n" + "\n".join(f"- {err}" for err in errors))
@@ -370,6 +416,12 @@ async def webcam(interaction: discord.Interaction):
         content = None
         if errors:
             content = "Some captures failed:\n" + "\n".join(f"- {err}" for err in errors)
+        if notes:
+            note_block = "\n".join(f"- {note}" for note in notes)
+            if content is None:
+                content = "Redaction notes:\n" + note_block
+            else:
+                content = content + "\n\nRedaction notes:\n" + note_block
 
         if files:
             if content is None:
