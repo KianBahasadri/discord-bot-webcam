@@ -13,6 +13,7 @@ import json
 import time
 import subprocess
 import shlex
+import shutil
 from typing import Callable, Optional
 
 import discord
@@ -32,6 +33,76 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+AUDIO_CAPTURE_BACKEND = "arecord"
+AUDIO_CAPTURE_DEVICE_ENV = "WEBCAM_AUDIO_DEVICE"
+AUDIO_CAPTURE_DEVICE_DEFAULT = "plughw:CARD=Device,DEV=0"
+AUDIO_CAPTURE_RATE = 48000
+AUDIO_CAPTURE_CHANNELS = 2
+AUDIO_CAPTURE_FORMAT = "S16_LE"
+AUDIO_CAPTURE_GAIN_PERCENT = 100
+AUDIO_POST_GAIN_DB = 4.0
+
+
+def _extract_alsa_card_selector(audio_device: str) -> str:
+    """Best-effort card selector for amixer -c from an ALSA device string."""
+    card_match = re.search(r"CARD=([^,]+)", audio_device)
+    if card_match:
+        return card_match.group(1)
+
+    hw_match = re.match(r"(?:plug)?hw:(\d+)(?:,\d+)?", audio_device)
+    if hw_match:
+        return hw_match.group(1)
+
+    return "Device"
+
+
+def _set_audio_gain_on_startup() -> None:
+    """Raise capture gain at startup so recordings are not too quiet."""
+    audio_device = os.environ.get(AUDIO_CAPTURE_DEVICE_ENV, AUDIO_CAPTURE_DEVICE_DEFAULT)
+    card_selector = _extract_alsa_card_selector(audio_device)
+
+    try:
+        subprocess.run(
+            ["amixer", "-c", card_selector, "sset", "Mic", f"{AUDIO_CAPTURE_GAIN_PERCENT}%", "cap"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=8,
+        )
+        subprocess.run(
+            ["amixer", "-c", card_selector, "sset", "Auto Gain Control", "on"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=8,
+        )
+        logger.info("Applied startup mic gain on ALSA card selector '%s'.", card_selector)
+    except Exception:
+        logger.exception("Failed to apply startup mic gain for audio device '%s'.", audio_device)
+
+
+def _apply_post_gain_inplace(path: str, gain_db: float) -> None:
+    """Apply software gain to a WAV file in place when ffmpeg is available."""
+    if gain_db <= 0 or not shutil.which("ffmpeg"):
+        return
+
+    boosted_tmp = f"{path}.boosted.wav"
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        path,
+        "-af",
+        f"volume={gain_db}dB",
+        boosted_tmp,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+    if proc.returncode != 0:
+        stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"Post-gain processing failed: {stderr or 'unknown error'}")
+
+    os.replace(boosted_tmp, path)
+
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 
 if not DISCORD_TOKEN:
@@ -49,6 +120,7 @@ class CamBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        await asyncio.to_thread(_set_audio_gain_on_startup)
         # Sync global command tree on startup
         await self.tree.sync()
         logger.info("Command tree synced.")
@@ -361,10 +433,239 @@ async def _run_redaction_job(name: str, path: str, timeout_s: int) -> dict:
         return {"name": name, "path": None, "error": msg, "metadata": None}
 
 
+def _capture_local_audio_to_tempfile(duration_s: int = 10) -> str:
+    """Record audio from the host microphone to a temporary file and return its path.
+
+    This is a best-effort implementation that tries common recorders (arecord, ffmpeg).
+    It raises RuntimeError on failure. This function is blocking and intended to be run
+    in a thread via asyncio.to_thread().
+    """
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+
+    backend = AUDIO_CAPTURE_BACKEND
+    audio_device = os.environ.get(AUDIO_CAPTURE_DEVICE_ENV, AUDIO_CAPTURE_DEVICE_DEFAULT)
+
+    try:
+        if backend == "arecord" and shutil.which("arecord"):
+            cmd = [
+                "arecord",
+                "-D",
+                audio_device,
+                "-d",
+                str(int(duration_s)),
+                "-f",
+                AUDIO_CAPTURE_FORMAT,
+                "-r",
+                str(AUDIO_CAPTURE_RATE),
+                "-c",
+                str(AUDIO_CAPTURE_CHANNELS),
+                "-t",
+                "wav",
+                tmp_path,
+            ]
+        elif shutil.which("ffmpeg"):
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "alsa",
+                "-i",
+                audio_device,
+                "-t",
+                str(int(duration_s)),
+                "-acodec",
+                "pcm_s16le",
+                "-ar",
+                str(AUDIO_CAPTURE_RATE),
+                "-ac",
+                str(AUDIO_CAPTURE_CHANNELS),
+                tmp_path,
+            ]
+        else:
+            raise RuntimeError("Audio capture unavailable: neither 'arecord' nor 'ffmpeg' is installed.")
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=int(duration_s) + 15)
+        if proc.returncode != 0:
+            stderr = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Audio capture failed: {stderr or 'unknown error'}")
+
+        # basic sanity check
+        if os.path.getsize(tmp_path) < 100:
+            raise RuntimeError("Captured audio file is too small; recording may have failed.")
+
+        try:
+            _apply_post_gain_inplace(tmp_path, AUDIO_POST_GAIN_DB)
+        except Exception as exc:
+            logger.warning("Unable to apply post gain to captured audio: %s", exc)
+
+        return tmp_path
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise RuntimeError(f"Audio capture timed out after {duration_s}s.") from exc
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
+
+
+async def _webcam_audio_capture_and_send(channel_id: int, duration_s: int = 10) -> None:
+    """Fire-and-forget helper: record microphone for duration_s and send file to channel.
+
+    This helper logs exceptions and attempts to post concise error messages in the
+    same channel when failures occur. It intentionally returns None and is meant to be
+    scheduled with asyncio.create_task(...) from the /webcam handler.
+    """
+    channel = None
+    tmp_path = None
+    audio_device = os.environ.get(AUDIO_CAPTURE_DEVICE_ENV, AUDIO_CAPTURE_DEVICE_DEFAULT)
+    safe_device = re.sub(r"[^A-Za-z0-9._-]+", "-", str(audio_device)).strip("-") or "unknown-device"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%I-%M-%S-%p")
+    upload_name = f"{timestamp}-{safe_device}.wav"
+    try:
+        # Resolve channel (try cache first, then REST fetch)
+        channel = client.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except Exception:
+                channel = None
+
+        if channel is None:
+            logger.warning("Webcam audio helper: could not resolve channel id %s", channel_id)
+            return
+
+        # Run blocking capture in a thread to avoid blocking the event loop
+        tmp_path = await asyncio.to_thread(_capture_local_audio_to_tempfile, duration_s)
+
+        # Attempt to send the resulting audio file
+        try:
+            await channel.send(file=discord.File(tmp_path, filename=upload_name))
+        except discord.Forbidden:
+            # Bot cannot post in channel
+            try:
+                await channel.send("Failed to send webcam audio: missing permission to post messages here.")
+            except Exception:
+                logger.exception("Failed to report audio send permission error to channel %s", channel_id)
+        except Exception as exc:
+            logger.exception("Failed to send webcam audio to channel %s: %s", channel_id, exc)
+            try:
+                await channel.send(f"Failed to send webcam audio: {exc}")
+            except Exception:
+                logger.exception("Failed to deliver audio error message to channel %s", channel_id)
+
+    except Exception as exc:
+        logger.exception("Unhandled error in webcam audio helper: %s", exc)
+        # Try to post a brief error message in the same channel
+        try:
+            if channel is None:
+                channel = client.get_channel(channel_id)
+            if channel is not None:
+                await channel.send(f"Webcam audio capture failed: {exc}")
+        except Exception:
+            logger.exception("Failed to report webcam audio helper error to channel %s", channel_id)
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                logger.exception("Error removing temporary audio file: %s", tmp_path)
+
+
+async def _delete_most_recent_bot_message(channel) -> dict:
+    """Helper: delete the most recent message authored by this bot in the given channel.
+
+    Returns a dict with keys:
+      - deleted: bool
+      - message_id: optional id of deleted message
+      - error: optional error string on failure
+
+    This helper intentionally performs no interaction responses; callers should
+    handle user-facing messages.
+    """
+    try:
+        # Iterate recent messages (newest first)
+        async for msg in channel.history(limit=200):
+            if getattr(msg, "author", None) and getattr(msg.author, "id", None) == client.user.id:
+                    try:
+                        await msg.delete()
+                        return {"deleted": True, "message_id": getattr(msg, "id", None), "error": None}
+                    except discord.Forbidden:
+                        return {"deleted": False, "message_id": None, "error": "forbidden"}
+                    except discord.NotFound:
+                        # Message disappeared between listing and deletion; continue scanning
+                        continue
+                    except Exception as exc:
+                        logger.exception("Failed to delete bot message %s: %s", getattr(msg, "id", None), exc)
+                        return {"deleted": False, "message_id": None, "error": str(exc)}
+
+        return {"deleted": False, "message_id": None, "error": "none_found"}
+    except discord.Forbidden:
+        return {"deleted": False, "message_id": None, "error": "forbidden"}
+    except Exception as exc:
+        logger.exception("Error scanning channel history for delete helper: %s", exc)
+        return {"deleted": False, "message_id": None, "error": str(exc)}
+
+
+@client.tree.command(name="delete", description="Delete the most recent bot-authored message in this channel")
+async def delete(interaction: discord.Interaction):
+    """Slash command handler: delete the most recent bot message in the same channel.
+
+    Provides concise user-facing messages and handles permission errors.
+    """
+    await interaction.response.defer()
+    channel = interaction.channel
+    if channel is None:
+        await interaction.followup.send("Error: could not determine channel.", ephemeral=True)
+        return
+
+    result = await _delete_most_recent_bot_message(channel)
+    if result.get("deleted"):
+        await interaction.followup.send("Deleted most recent bot message.", ephemeral=True)
+        return
+
+    err = result.get("error") or "unknown"
+    if err == "none_found":
+        await interaction.followup.send("No recent bot message to delete.", ephemeral=True)
+    elif err == "forbidden":
+        await interaction.followup.send("I lack permission to delete messages in this channel.", ephemeral=True)
+    else:
+        await interaction.followup.send(f"Failed to delete bot message: {err}", ephemeral=True)
+
+
+
 @client.tree.command(name="webcam", description="idek wtf im doing anymore")
 async def webcam(interaction: discord.Interaction):
     """Slash command handler: capture local webcam, remote webcam, and HDMI screenshot."""
     await interaction.response.defer()
+    # Trigger a fire-and-forget audio capture/send helper exactly once per /webcam invocation.
+    try:
+        channel_id = None
+        if getattr(interaction, "channel", None) is not None:
+            channel_id = interaction.channel.id
+        else:
+            channel_id = getattr(interaction, "channel_id", None)
+
+        if channel_id is not None:
+            # Allow override of duration via env var; default 10s
+            try:
+                duration = int(os.environ.get("WEBCAM_AUDIO_DURATION_SECONDS", "10"))
+            except Exception:
+                duration = 10
+            # Schedule non-blocking fire-and-forget task
+            try:
+                asyncio.create_task(_webcam_audio_capture_and_send(channel_id, duration_s=duration))
+            except Exception:
+                logger.exception("Failed to create background task for webcam audio helper")
+    except Exception:
+        logger.exception("Unexpected error scheduling webcam audio helper")
+
     tmp_paths = []
     try:
         timeout_s = int(os.environ.get("WEBCAM_CAPTURE_TIMEOUT_SECONDS", "20"))

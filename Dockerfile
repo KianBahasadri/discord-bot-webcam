@@ -7,7 +7,7 @@ WORKDIR /app
 # Install system deps required by opencv and linux video
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-       libglib2.0-0 v4l-utils openssh-client \
+       libglib2.0-0 v4l-utils openssh-client ffmpeg alsa-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
