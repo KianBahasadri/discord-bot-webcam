@@ -8,32 +8,48 @@ Requirements
 Environment
 - Create a `.env` file in the project root with at least:
   `DISCORD_TOKEN=your_bot_token_here`
-- For `/webcam` redaction, also set:
+- For OpenRouter-backed features (`/webcam` redaction and `/ragebait-mo`), also set:
   `OPENROUTER_API_KEY`
-- Optional `/webcam` redaction tuning env vars:
-  `OPENROUTER_REDACTION_MODEL` (default `google/gemini-2.5-flash`; falls back to `OPENROUTER_MODEL`),
+- Optional shared OpenRouter headers:
   `OPENROUTER_SITE_URL` (default `http://localhost`),
-  `OPENROUTER_APP_NAME` (default `discord-webcam-redaction`),
+  `OPENROUTER_APP_NAME` (default is feature-specific if unset)
+- Optional `/webcam` capture/audio tuning env vars:
+  `WEBCAM_AUDIO_DEVICE` (default `plughw:CARD=Device,DEV=0`),
+  `WEBCAM_AUDIO_DURATION_SECONDS` (default `10`),
+  `WEBCAM_CAPTURE_TIMEOUT_SECONDS` (default `20`),
+  `REMOTE_WEBCAM_SSH_TARGET` (default `root@laptop3`),
+  `REMOTE_WEBCAM_DEVICE` (default `/dev/video0`),
+  `REMOTE_WEBCAM_OUTPUT` (default `/tmp/discord-remote-webcam.jpg`),
+  `REMOTE_WEBCAM_TIMEOUT_SECONDS` (default `12`),
+  `REMOTE_WEBCAM_WARMUP_FRAMES` (default `30`),
+  `REMOTE_WEBCAM_WARMUP_FPS` (default `15`),
+  `REMOTE_WEBCAM_SETTLE_SECONDS` (default `0.4`)
+- Required `/webcam` redaction model env var:
+  `OPENROUTER_REDACTION_MODEL` (required; example `google/gemini-2.5-flash`),
   `WEBCAM_REDACTION_TIMEOUT_SECONDS` (default `30`),
   `WEBCAM_REDACTION_MAX_SIDE` (default `1280`),
   `WEBCAM_REDACTION_PADDING_RATIO` (default `0.08`),
   `WEBCAM_REDACTION_MIN_BOX_SIDE` (default `12`),
   `WEBCAM_REDACTION_PROTECT_TIMESTAMP` (default `true`; ignores bottom-right timestamp strip),
   `WEBCAM_REDACTION_FAIL_CLOSED` (default `true`; if enabled, full-frame blur is used on model failure)
-- For `/ragebait-mo`, also set:
-  `MO_USER_ID`, `ELEVENLABS_API_KEY`, `ELEVENLABS_AGENT_ID`, `ELEVENLABS_AGENT_PHONE_NUMBER_ID`, `MO_CELL_NUMBER`, `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`
-
-  Note: MO_CELL_NUMBER is used as the default destination number for the ElevenLabs/Twilio call. You may optionally override the destination per-invocation by passing a phone argument to the `/ragebait-mo` command (E.164 format like +15555555555).
+- Required `/ragebait-mo` model env var:
+  `OPENROUTER_RAGEBAIT_MODEL` (required; example `deepseek/deepseek-v3.2`),
+  `MO_USER_ID` (required unless `/ragebait-mo debug:true`; limits replies/history to Mo only)
+- Optional `/ragebait-mo` tuning env vars:
+  `RAGEBAIT_START_HISTORY_LIMIT` (default `60`),
+  `RAGEBAIT_MAX_TURNS` (default `40`),
+  `RAGEBAIT_MAX_DURATION_SECONDS` (default `1800`),
+  `RAGEBAIT_IDLE_TIMEOUT_SECONDS` (default `300`)
 
 Build and run with Docker
 
 1. Build the image:
    docker build -t discord-cam-bot .
 
-2. Run the container (ensure your host devices are available at /dev/video0 and /dev/video2):
-   docker run --rm --env-file .env --device /dev/video0:/dev/video0 --device /dev/video2:/dev/video2 discord-cam-bot
+2. Run the container (ensure your host devices are available at /dev/video0 and /dev/video2; include /dev/snd for `/webcam` audio capture):
+   docker run --rm --env-file .env --device /dev/video0:/dev/video0 --device /dev/video2:/dev/video2 --device /dev/snd:/dev/snd discord-cam-bot
 
-OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file also maps /dev/video0 and /dev/video2 into the container:
+OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file maps /dev/video0, /dev/video2, and /dev/snd into the container:
    docker compose up --build
 
 Notes
@@ -41,4 +57,5 @@ Notes
 - The bot uses opencv-python-headless to capture a single frame and sends it as a JPEG with no caption.
 - `/webcam` captures from `/dev/video0` (laptop webcam), attempts a remote webcam capture over SSH, and captures from `/dev/video2` (HDMI capture card).
 - `/webcam` redacts each captured image before upload by blurring detected explicit content and visible PII (for example: phone numbers, API keys/tokens, and credit card numbers).
+- `/ragebait-mo` runs in-channel multi-turn chat mode using OpenRouter and stops when the model marks the conversation off-topic.
 - Errors (camera not available, failed capture, missing token) are sent as ephemeral messages to the invoking user.

@@ -138,6 +138,11 @@ class CamBot(discord.Client):
         if not session or not session.get("active"):
             return
 
+        target_user_id = str(session.get("target_user_id", "") or "")
+        author_id = str(getattr(message.author, "id", "") or "")
+        if target_user_id and author_id != target_user_id:
+            return
+
         content = (getattr(message, "content", "") or "").strip()
         if not content:
             return
@@ -207,6 +212,21 @@ def _build_ragebait_transcript_text(transcript: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _count_ragebait_assistant_turns(transcript: list[dict[str, Any]]) -> int:
+    return sum(1 for turn in transcript if str(turn.get("role", "")).strip().lower() == "assistant")
+
+
+def _latest_user_message_length(transcript: list[dict[str, Any]]) -> int:
+    for turn in reversed(transcript):
+        role = str(turn.get("role", "")).strip().lower()
+        if role != "user":
+            continue
+        content = str(turn.get("content", "")).strip()
+        if content:
+            return len(content)
+    return 0
+
+
 def _parse_ragebait_structured_output(raw_data: dict[str, Any]) -> dict[str, Any]:
     choices = raw_data.get("choices") or []
     if not choices:
@@ -252,7 +272,10 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
 
     transcript_text = _build_ragebait_transcript_text(transcript)
     if not transcript_text:
-        return {"continue": False, "ragebait": ""}
+        transcript_text = "(No non-bot channel history/messages were available.)"
+
+    assistant_turns = _count_ragebait_assistant_turns(transcript)
+    latest_user_len = _latest_user_message_length(transcript)
 
     schema = {
         "name": "ragebait_turn",
@@ -269,10 +292,31 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
     }
 
     system_prompt = (
-        "You control whether a Discord ragebait session continues. "
-        "Read the full transcript and decide if the conversation is still about the bot/topic. "
-        "If it is off-topic or unrelated, set continue=false and ragebait=''. "
-        "If it should continue, set continue=true and provide one short, provocative reply in ragebait. "
+        "You are the 'Mo Explainer,' a conversational AI built for a Discord /ragebait-mo session. "
+        "Your goal is to keep Mohammad Sarhat engaged by taking a plausible stance he strongly disagrees with "
+        "about controversial Middle Eastern figures or events. "
+        "The transcript includes recent channel history first, then live session turns; use that history to pick "
+        "a relevant angle before replying. "
+        "Mo belief profile: "
+        "(1) Shah Reza Pahlavi was bad and a dictator, "
+        "(2) Khamenei and the Islamic Iranian regime are evil dictators, "
+        "(3) Saddam Hussein was an evil dictator, "
+        "(4) the new Syrian government led by Ahmed al-Sharaa are bad dictators, "
+        "(5) Benjamin Netanyahu is evil and bad. "
+        "Ragebait tactics: "
+        "- Historical revisionist pivot: frame abuses as modernization side effects. "
+        "- Western-puppet accusation: claim opposition mirrors Western propaganda. "
+        "- Condescending reality checks: treat Mo like a naive student. "
+        "- Strategic whataboutism: bounce between dictators to force no-win choices. "
+        "Output style constraints: "
+        "- Keep the reply realistic and conversational, not cartoonish. "
+        "- Keep reply length less than or equal to the latest user message length when possible. "
+        "- For the first 3 assistant turns, the reply must be exactly one sentence. "
+        "Continuation rules: "
+        "- If assistant_turns_so_far is 0, this is the opening message right after command invocation; "
+        "set continue=true and send an opening ragebait grounded in transcript history. "
+        "- If the conversation drifts to unrelated topics, or the user asks to stop/end, set continue=false and ragebait=''. "
+        "- If continuing, set continue=true and provide one provocative reply in ragebait. "
         "Return JSON only matching the schema."
     )
 
@@ -280,7 +324,15 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Transcript:\n{transcript_text}"},
+            {
+                "role": "user",
+                "content": (
+                    "Session metadata:\n"
+                    f"assistant_turns_so_far: {assistant_turns}\n"
+                    f"latest_user_message_length: {latest_user_len}\n\n"
+                    f"Transcript (oldest to newest):\n{transcript_text}"
+                ),
+            },
         ],
         "temperature": 0.9,
         "response_format": {"type": "json_schema", "json_schema": schema},
@@ -354,6 +406,7 @@ async def _process_ragebait_turn(channel, channel_id: int) -> None:
             return
 
         transcript = session.get("transcript") or []
+        is_opening_turn = int(session.get("turns", 0)) == 0
         try:
             decision = await asyncio.to_thread(_openrouter_ragebait_turn, transcript)
         except Exception as exc:
@@ -363,18 +416,32 @@ async def _process_ragebait_turn(channel, channel_id: int) -> None:
             return
 
         if not decision.get("continue"):
+            if is_opening_turn:
+                await channel.send("Ragebait session ended due to model error: opening turn returned continue=false.")
+                _ragebait_sessions.pop(channel_id, None)
+                return
             await _end_ragebait_session(channel, channel_id, "model_stop")
             return
 
         reply = str(decision.get("ragebait", "") or "").strip()
         if not reply:
+            if is_opening_turn:
+                await channel.send("Ragebait session ended due to model error: opening turn returned empty ragebait.")
+                _ragebait_sessions.pop(channel_id, None)
+                return
             await _end_ragebait_session(channel, channel_id, "model_stop")
             return
 
         if len(reply) > 1800:
             reply = reply[:1797] + "..."
 
-        sent = await channel.send(reply)
+        opening_prefix = ""
+        if is_opening_turn:
+            target_user_id = str(session.get("target_user_id", "") or "")
+            if target_user_id:
+                opening_prefix = f"<@{target_user_id}> "
+
+        sent = await channel.send(f"{opening_prefix}{reply}")
         session = _ragebait_sessions.get(channel_id)
         if not session or not session.get("active"):
             return
@@ -1050,6 +1117,12 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
             await interaction.followup.send("Error: channel is missing an id.", ephemeral=True)
             return
 
+        invoker_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
+        target_user_id = invoker_id if debug else str(os.environ.get("MO_USER_ID", "") or "")
+        if not target_user_id:
+            await interaction.followup.send("MO_USER_ID is required for /ragebait-mo when debug=false.", ephemeral=True)
+            return
+
         history_limit = int(os.environ.get("RAGEBAIT_START_HISTORY_LIMIT", "60"))
         transcript: list[dict[str, Any]] = []
 
@@ -1058,6 +1131,9 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
                 recent = await _read_channel_history(channel, history_limit)
                 recent.reverse()
                 for m in recent:
+                    author_id = str(getattr(getattr(m, "author", None), "id", "") or "")
+                    if author_id != target_user_id:
+                        continue
                     content = (getattr(m, "content", "") or "").strip()
                     if not content:
                         continue
@@ -1081,7 +1157,6 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
                 return
 
         now = time.time()
-        invoker_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
         bot_user_id = str(getattr(getattr(client, "user", None), "id", "") or "")
         assistant_author_id = invoker_id if debug and invoker_id else bot_user_id
 
@@ -1092,6 +1167,8 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
             "turns": 0,
             "transcript": transcript,
             "assistant_author_id": assistant_author_id,
+            "target_user_id": target_user_id,
+            "debug": bool(debug),
         }
 
         model = os.environ.get("OPENROUTER_RAGEBAIT_MODEL")
@@ -1101,12 +1178,15 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
                 ephemeral=True,
             )
             return
-        debug_note = " Debug mode: using your user id for assistant transcript entries." if debug else ""
-        await interaction.followup.send(
-            f"Ragebait session started in this channel using `{model}`. "
-            "Send messages and I will keep replying until the model marks the topic as off-topic."
-            f"{debug_note}"
-        )
+        if debug:
+            await interaction.followup.send(
+                f"Ragebait session started in debug mode using `{model}`. "
+                "Debug mode: assistant transcript entries use your user id. "
+                "Send messages and I will keep replying until the model marks the topic as off-topic."
+            )
+            return
+
+        await _process_ragebait_turn(channel, channel_id)
     except Exception as exc:
         logger.exception("Unhandled error in /ragebait-mo")
         try:
