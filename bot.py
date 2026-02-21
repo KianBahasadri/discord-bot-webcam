@@ -14,10 +14,11 @@ import time
 import subprocess
 import shlex
 import shutil
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import discord
 import asyncio
+import requests
 from discord import app_commands
 from media_redaction import redact_sensitive_media_inplace
 
@@ -125,8 +126,274 @@ class CamBot(discord.Client):
         await self.tree.sync()
         logger.info("Command tree synced.")
 
+    async def on_message(self, message: discord.Message):
+        if getattr(message.author, "bot", False):
+            return
+
+        channel_id = getattr(getattr(message, "channel", None), "id", None)
+        if channel_id is None:
+            return
+
+        session = _ragebait_sessions.get(channel_id)
+        if not session or not session.get("active"):
+            return
+
+        content = (getattr(message, "content", "") or "").strip()
+        if not content:
+            return
+
+        session["last_activity"] = time.time()
+        session["transcript"].append(
+            {
+                "role": "user",
+                "author_id": str(getattr(message.author, "id", "")),
+                "author": getattr(message.author, "display_name", None)
+                or getattr(message.author, "name", "user"),
+                "content": content,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
+        await _process_ragebait_turn(message.channel, channel_id)
+
 
 client = CamBot()
+
+
+_ragebait_sessions: dict[int, dict[str, Any]] = {}
+_ragebait_locks: dict[int, asyncio.Lock] = {}
+
+
+def _extract_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _build_ragebait_transcript_text(transcript: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for i, turn in enumerate(transcript, start=1):
+        role = str(turn.get("role", "user"))
+        author = str(turn.get("author", "unknown"))
+        content = str(turn.get("content", "")).strip()
+        if not content:
+            continue
+        lines.append(f"{i}. [{role}] {author}: {content}")
+    return "\n".join(lines)
+
+
+def _parse_ragebait_structured_output(raw_data: dict[str, Any]) -> dict[str, Any]:
+    choices = raw_data.get("choices") or []
+    if not choices:
+        raise RuntimeError("OpenRouter returned no choices.")
+
+    message = (choices[0] or {}).get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    else:
+        text = str(content or "")
+
+    parsed: Any
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        maybe = _extract_json_object(text)
+        if not maybe:
+            raise RuntimeError(f"Model did not return JSON output: {text[:300]}")
+        parsed = json.loads(maybe)
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Model JSON output is not an object.")
+
+    should_continue = bool(parsed.get("continue", False))
+    ragebait = str(parsed.get("ragebait", "") or "").strip()
+    if not should_continue:
+        ragebait = ""
+    if should_continue and not ragebait:
+        should_continue = False
+
+    return {"continue": should_continue, "ragebait": ragebait}
+
+
+def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any]:
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is required for /ragebait-mo.")
+
+    model = os.environ.get("OPENROUTER_RAGEBAIT_MODEL")
+    if not model:
+        raise RuntimeError("OPENROUTER_RAGEBAIT_MODEL is required for /ragebait-mo.")
+
+    transcript_text = _build_ragebait_transcript_text(transcript)
+    if not transcript_text:
+        return {"continue": False, "ragebait": ""}
+
+    schema = {
+        "name": "ragebait_turn",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "continue": {"type": "boolean"},
+                "ragebait": {"type": "string"},
+            },
+            "required": ["continue", "ragebait"],
+            "additionalProperties": False,
+        },
+    }
+
+    system_prompt = (
+        "You control whether a Discord ragebait session continues. "
+        "Read the full transcript and decide if the conversation is still about the bot/topic. "
+        "If it is off-topic or unrelated, set continue=false and ragebait=''. "
+        "If it should continue, set continue=true and provide one short, provocative reply in ragebait. "
+        "Return JSON only matching the schema."
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Transcript:\n{transcript_text}"},
+        ],
+        "temperature": 0.9,
+        "response_format": {"type": "json_schema", "json_schema": schema},
+        "reasoning": {"effort": "high"},
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL", "http://localhost"),
+        "X-Title": os.environ.get("OPENROUTER_APP_NAME", "discord-ragebait-mo"),
+    }
+
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=90,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"OpenRouter error {response.status_code}: {response.text[:600]}")
+
+    data = response.json()
+    return _parse_ragebait_structured_output(data)
+
+
+def _ragebait_limits_exceeded(session: dict[str, Any]) -> str | None:
+    now = time.time()
+    max_turns = int(os.environ.get("RAGEBAIT_MAX_TURNS", "40"))
+    max_duration = int(os.environ.get("RAGEBAIT_MAX_DURATION_SECONDS", "1800"))
+    idle_timeout = int(os.environ.get("RAGEBAIT_IDLE_TIMEOUT_SECONDS", "300"))
+
+    if int(session.get("turns", 0)) >= max_turns:
+        return "turn_limit"
+    if (now - float(session.get("started_at", now))) >= max_duration:
+        return "duration_limit"
+    if (now - float(session.get("last_activity", now))) >= idle_timeout:
+        return "idle_timeout"
+    return None
+
+
+async def _end_ragebait_session(channel, channel_id: int, reason: str) -> None:
+    session = _ragebait_sessions.get(channel_id)
+    if not session:
+        return
+    session["active"] = False
+    _ragebait_sessions.pop(channel_id, None)
+
+    if reason == "model_stop":
+        await channel.send("Ragebait session ended: conversation went off-topic.")
+    elif reason == "turn_limit":
+        await channel.send("Ragebait session ended: max turns reached.")
+    elif reason == "duration_limit":
+        await channel.send("Ragebait session ended: max duration reached.")
+    elif reason == "idle_timeout":
+        await channel.send("Ragebait session ended: idle timeout reached.")
+    else:
+        await channel.send("Ragebait session ended.")
+
+
+async def _process_ragebait_turn(channel, channel_id: int) -> None:
+    lock = _ragebait_locks.setdefault(channel_id, asyncio.Lock())
+    async with lock:
+        session = _ragebait_sessions.get(channel_id)
+        if not session or not session.get("active"):
+            return
+
+        limit_reason = _ragebait_limits_exceeded(session)
+        if limit_reason:
+            await _end_ragebait_session(channel, channel_id, limit_reason)
+            return
+
+        transcript = session.get("transcript") or []
+        try:
+            decision = await asyncio.to_thread(_openrouter_ragebait_turn, transcript)
+        except Exception as exc:
+            logger.exception("Failed to generate ragebait turn")
+            await channel.send(f"Ragebait session ended due to model error: {exc}")
+            _ragebait_sessions.pop(channel_id, None)
+            return
+
+        if not decision.get("continue"):
+            await _end_ragebait_session(channel, channel_id, "model_stop")
+            return
+
+        reply = str(decision.get("ragebait", "") or "").strip()
+        if not reply:
+            await _end_ragebait_session(channel, channel_id, "model_stop")
+            return
+
+        if len(reply) > 1800:
+            reply = reply[:1797] + "..."
+
+        sent = await channel.send(reply)
+        session = _ragebait_sessions.get(channel_id)
+        if not session or not session.get("active"):
+            return
+
+        session["turns"] = int(session.get("turns", 0)) + 1
+        session["last_activity"] = time.time()
+        assistant_author_id = str(
+            session.get("assistant_author_id", "")
+            or getattr(getattr(sent, "author", None), "id", "")
+        )
+        session["transcript"].append(
+            {
+                "role": "assistant",
+                "author_id": assistant_author_id,
+                "author": "Mo",
+                "content": reply,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+        )
 
 
 def _read_stable_frame(cap: "cv2.VideoCapture", warmup_reads: int = 10, delay_s: float = 0.05):
@@ -522,7 +789,7 @@ async def _webcam_audio_capture_and_send(channel_id: int, duration_s: int = 10) 
     same channel when failures occur. It intentionally returns None and is meant to be
     scheduled with asyncio.create_task(...) from the /webcam handler.
     """
-    channel = None
+    channel: Any = None
     tmp_path = None
     audio_device = os.environ.get(AUDIO_CAPTURE_DEVICE_ENV, AUDIO_CAPTURE_DEVICE_DEFAULT)
     safe_device = re.sub(r"[^A-Za-z0-9._-]+", "-", str(audio_device)).strip("-") or "unknown-device"
@@ -590,6 +857,8 @@ async def _delete_most_recent_bot_message(channel) -> dict:
     handle user-facing messages.
     """
     try:
+        if client.user is None:
+            return {"deleted": False, "message_id": None, "error": "bot_not_ready"}
         # Iterate recent messages (newest first)
         async for msg in channel.history(limit=200):
             if getattr(msg, "author", None) and getattr(msg.author, "id", None) == client.user.id:
@@ -611,6 +880,17 @@ async def _delete_most_recent_bot_message(channel) -> dict:
     except Exception as exc:
         logger.exception("Error scanning channel history for delete helper: %s", exc)
         return {"deleted": False, "message_id": None, "error": str(exc)}
+
+
+async def _read_channel_history(channel: Any, limit: int) -> list[Any]:
+    history = getattr(channel, "history", None)
+    if not callable(history):
+        return []
+    iterator: Any = history(limit=limit)
+    out: list[Any] = []
+    async for msg in iterator:
+        out.append(msg)
+    return out
 
 
 @client.tree.command(name="delete", description="Delete the most recent bot-authored message in this channel")
@@ -647,8 +927,9 @@ async def webcam(interaction: discord.Interaction):
     # Trigger a fire-and-forget audio capture/send helper exactly once per /webcam invocation.
     try:
         channel_id = None
-        if getattr(interaction, "channel", None) is not None:
-            channel_id = interaction.channel.id
+        interaction_channel = getattr(interaction, "channel", None)
+        if interaction_channel is not None:
+            channel_id = interaction_channel.id
         else:
             channel_id = getattr(interaction, "channel_id", None)
 
@@ -751,88 +1032,12 @@ async def webcam(interaction: discord.Interaction):
                 logger.exception("Error removing temporary file: %s", tmp_path)
 
 
-@client.tree.command(name="ragebait-mo", description="Ragebait Mohammad Sarhat and show the proof")
-async def ragebait_mo(interaction: discord.Interaction, phone: Optional[str] = None):
-    """Slash command handler: extract topic from Mo's recent messages and run helper-driven flow."""
+@client.tree.command(name="ragebait-mo", description="Start live ragebait chat with Mo in this channel")
+async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
     await interaction.response.defer()
     try:
-        # Allow an optional per-invocation phone override. If provided, MO_CELL_NUMBER is not required.
-        def _sanitize_phone_input(raw: Optional[str]) -> Optional[str]:
-            if not raw:
-                return None
-            s = raw.strip()
-            # strip common separators and tel: prefix
-            s = re.sub(r"[ \-\(\)\.]", "", s)
-            s = re.sub(r"^tel:", "", s, flags=re.I)
-            # normalize digits and leading +
-            if s.count("+") > 1:
-                return None
-            if not s.startswith("+"):
-                digits = re.sub(r"\D", "", s)
-                s = "+" + digits
-            else:
-                s = "+" + re.sub(r"\D", "", s[1:])
-            # E.164-ish validation: + followed by 2-15 digits, not starting with 0
-            if re.match(r"^\+[1-9]\d{1,14}$", s):
-                return s
-            return None
-
-        phone_override = None
-        if phone is not None:
-            phone_override = _sanitize_phone_input(phone)
-            if phone_override is None:
-                await interaction.followup.send(
-                    "Invalid phone number provided. Please supply an E.164-style number like +15555555555 or just digits.",
-                    ephemeral=True,
-                )
-                return
-
-        base_required = [
-            "MO_USER_ID",
-            "ELEVENLABS_API_KEY",
-            "ELEVENLABS_AGENT_ID",
-            "ELEVENLABS_AGENT_PHONE_NUMBER_ID",
-            "AZURE_OPENAI_ENDPOINT",
-            "AZURE_OPENAI_API_KEY",
-            "AZURE_OPENAI_DEPLOYMENT",
-            "AZURE_OPENAI_API_VERSION",
-        ]
-        required_env_vars = list(base_required)
-        if not phone_override:
-            required_env_vars.append("MO_CELL_NUMBER")
-
-        missing = [name for name in required_env_vars if not os.environ.get(name)]
-        if missing:
-            await interaction.followup.send(
-                f"Missing required environment variables for /ragebait-mo: {', '.join(missing)}",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            mo_user_id_raw = os.environ.get("MO_USER_ID")
-            mo_user_id = int(mo_user_id_raw) if mo_user_id_raw is not None else None
-        except Exception:
-            await interaction.followup.send("MO_USER_ID must be a valid Discord user ID (integer).", ephemeral=True)
-            return
-        if mo_user_id is None:
-            await interaction.followup.send("MO_USER_ID must be set for /ragebait-mo.", ephemeral=True)
-            return
-
-        try:
-            from ragebait_helpers import (
-                generate_topic_with_azure,
-                start_elevenlabs_call,
-                poll_conversation_until_terminal,
-                format_transcript,
-                fetch_conversation_audio_with_retry,
-            )
-        except Exception as exc:
-            logger.exception("Failed to import ragebait_helpers in /ragebait-mo")
-            await interaction.followup.send(
-                f"/ragebait-mo is unavailable: failed to import ragebait_helpers ({exc}).",
-                ephemeral=True,
-            )
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            await interaction.followup.send("OPENROUTER_API_KEY is required for /ragebait-mo.", ephemeral=True)
             return
 
         channel = interaction.channel
@@ -840,226 +1045,68 @@ async def ragebait_mo(interaction: discord.Interaction, phone: Optional[str] = N
             await interaction.followup.send("Error: could not determine channel.", ephemeral=True)
             return
 
-        # Fetch up to 100 recent messages from the channel
-        try:
-            msgs = [m async for m in channel.history(limit=100)]
-        except discord.Forbidden:
+        channel_id = getattr(channel, "id", None)
+        if channel_id is None:
+            await interaction.followup.send("Error: channel is missing an id.", ephemeral=True)
+            return
+
+        history_limit = int(os.environ.get("RAGEBAIT_START_HISTORY_LIMIT", "60"))
+        transcript: list[dict[str, Any]] = []
+
+        if callable(getattr(channel, "history", None)):
+            try:
+                recent = await _read_channel_history(channel, history_limit)
+                recent.reverse()
+                for m in recent:
+                    content = (getattr(m, "content", "") or "").strip()
+                    if not content:
+                        continue
+                    if getattr(getattr(m, "author", None), "bot", False):
+                        continue
+                    transcript.append(
+                        {
+                            "role": "user",
+                            "author_id": str(getattr(getattr(m, "author", None), "id", "")),
+                            "author": getattr(getattr(m, "author", None), "display_name", None)
+                            or getattr(getattr(m, "author", None), "name", "user"),
+                            "content": content,
+                            "timestamp": datetime.utcnow().isoformat(),
+                        }
+                    )
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    "I can't read message history in this channel. Please grant Read Message History.",
+                    ephemeral=True,
+                )
+                return
+
+        now = time.time()
+        invoker_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
+        bot_user_id = str(getattr(getattr(client, "user", None), "id", "") or "")
+        assistant_author_id = invoker_id if debug and invoker_id else bot_user_id
+
+        _ragebait_sessions[channel_id] = {
+            "active": True,
+            "started_at": now,
+            "last_activity": now,
+            "turns": 0,
+            "transcript": transcript,
+            "assistant_author_id": assistant_author_id,
+        }
+
+        model = os.environ.get("OPENROUTER_RAGEBAIT_MODEL")
+        if not model:
             await interaction.followup.send(
-                "I can't read message history in this channel (missing access). "
-                "Please grant View Channel and Read Message History. "
-                "Helpful note: this can also happen if the Discord application was installed as an app-only install "
-                "(applications.commands) instead of including a bot install (bot scope).",
+                "OPENROUTER_RAGEBAIT_MODEL is required for /ragebait-mo.",
                 ephemeral=True,
             )
             return
-
-        # Filter to MO_USER_ID, non-bot, non-empty content
-        mo_msgs = [m for m in msgs if getattr(m, "author", None) and getattr(m.author, "id", None) == mo_user_id and not getattr(m.author, "bot", False) and getattr(m, "content", "") and m.content.strip()]
-
-        if not mo_msgs:
-            prompt_text = "2026 Iran US peace negotiations"
-            await interaction.followup.send(
-                "No recent messages from Mo found; using default topic context: 2026 Iran US peace negotiations.",
-                ephemeral=False,
-            )
-        else:
-            # Build input text (chronological)
-            mo_msgs = list(reversed(mo_msgs))
-            prompt_text = "\n\n".join(m.content.strip() for m in mo_msgs if m.content and m.content.strip())
-
-        # Generate topic using Azure helper (run in thread to avoid blocking)
-        await interaction.followup.send("Extracting topic from recent messages...", ephemeral=False)
-        try:
-            dynamic_topic = await asyncio.to_thread(generate_topic_with_azure, prompt_text, "Mo recent conversation")
-        except Exception as exc:
-            # Do not hard-fail if topic generation errors; log and continue with a
-            # sensible fallback topic string so the command can proceed.
-            logger.exception("generate_topic_with_azure failed")
-            dynamic_topic = "Mo recent conversation"
-            await interaction.followup.send("Failed to generate dynamic topic via Azure; using fallback topic.", ephemeral=False)
-
-        await interaction.followup.send(f"Generated topic: {dynamic_topic}", ephemeral=False)
-
-        # Start ElevenLabs agent call
-        await interaction.followup.send("Starting ElevenLabs agent call...", ephemeral=False)
-        try:
-            effective_to = phone_override if phone_override else os.environ.get("MO_CELL_NUMBER")
-            start_resp = await asyncio.to_thread(
-                start_elevenlabs_call, dynamic_topic, override_to_number=effective_to
-            )
-        except Exception as exc:
-            logger.exception("start_elevenlabs_call failed")
-            await interaction.followup.send(f"Failed to start ElevenLabs call: {exc}", ephemeral=True)
-            return
-
-        # Attempt to extract conversation id from start response with robust fallbacks
-        def _recursive_find_id(obj, depth=0, max_depth=6):
-            if depth > max_depth:
-                return None
-            # dict: check common id keys first, then traverse
-            if isinstance(obj, dict):
-                for key in ("conversation_id", "conversationId"):
-                    if key in obj and obj[key] not in (None, ""):
-                        val = obj[key]
-                        if isinstance(val, (str, int)):
-                            return str(val)
-                        if isinstance(val, dict):
-                            # nested id under dict
-                            for ik in ("conversation_id", "conversationId"):
-                                if ik in val and val[ik]:
-                                    return str(val[ik])
-                # prefer certain container keys to speed up search
-                for container in ("conversation", "data", "result", "payload", "body", "response"):
-                    if container in obj:
-                        res = _recursive_find_id(obj[container], depth + 1, max_depth)
-                        if res:
-                            return res
-                # fallback: search all values
-                for v in obj.values():
-                    res = _recursive_find_id(v, depth + 1, max_depth)
-                    if res:
-                        return res
-
-            # list: iterate
-            if isinstance(obj, list):
-                for item in obj:
-                    res = _recursive_find_id(item, depth + 1, max_depth)
-                    if res:
-                        return res
-
-            # string: try parsing JSON, JSON substring, then regex patterns
-            if isinstance(obj, str):
-                s = obj.strip()
-                # try full JSON parse
-                try:
-                    parsed = json.loads(s)
-                    return _recursive_find_id(parsed, depth + 1, max_depth)
-                except Exception:
-                    pass
-
-                # try to find a balanced JSON substring and parse it
-                start = s.find("{")
-                if start != -1:
-                    depth_count = 0
-                    for i in range(start, len(s)):
-                        ch = s[i]
-                        if ch == "{":
-                            depth_count += 1
-                        elif ch == "}":
-                            depth_count -= 1
-                            if depth_count == 0:
-                                jsub = s[start : i + 1]
-                                try:
-                                    parsed = json.loads(jsub)
-                                    res = _recursive_find_id(parsed, depth + 1, max_depth)
-                                    if res:
-                                        return res
-                                except Exception:
-                                    pass
-                                break
-
-                # regex search for common id keys
-                patterns = [
-                    r'"conversation_id"\s*:\s*"([^\"]+)"',
-                    r'"conversationId"\s*:\s*"([^\"]+)"',
-                    r'conversation_id=([A-Za-z0-9_\-:\.]+)',
-                    r'conversationId=([A-Za-z0-9_\-:\.]+)',
-                ]
-                for pat in patterns:
-                    m = re.search(pat, s)
-                    if m:
-                        return m.group(1)
-
-            return None
-
-        conversation_id = _recursive_find_id(start_resp)
-        # keep backward-compatible behavior: if response was a raw string, allow it
-        if not conversation_id and isinstance(start_resp, str):
-            conversation_id = start_resp
-
-        if not conversation_id:
-            logger.error("Could not determine conversation id from start_elevenlabs_call response: %r", start_resp)
-            await interaction.followup.send("Failed to determine conversation id from ElevenLabs start response.", ephemeral=True)
-            return
-
-        await interaction.followup.send(f"Conversation started (id: {conversation_id}). Polling until finished...", ephemeral=False)
-
-        # Poll until terminal
-        try:
-            conversation_payload = await asyncio.to_thread(poll_conversation_until_terminal, str(conversation_id))
-        except Exception as exc:
-            logger.exception("poll_conversation_until_terminal failed")
-            await interaction.followup.send(f"Failed while polling conversation: {exc}", ephemeral=True)
-            return
-
-        # Format transcript
-        try:
-            transcript_text = await asyncio.to_thread(format_transcript, conversation_payload)
-        except Exception as exc:
-            logger.exception("format_transcript failed")
-            await interaction.followup.send(f"Failed to format transcript: {exc}", ephemeral=True)
-            return
-
-        if not transcript_text:
-            await interaction.followup.send("Transcript is empty.", ephemeral=True)
-            return
-
-        # Attempt to download the conversation audio from the documented
-        # ElevenLabs endpoint and upload it to Discord so we can include a
-        # stable recording URL in the final transcript. Failure here should
-        # not abort the command; we continue without a recording link.
-        audio_url = None
-        try:
-            # Download audio bytes with bounded retry policy (run in thread to avoid blocking)
-            audio_bytes, audio_ext = await asyncio.to_thread(fetch_conversation_audio_with_retry, str(conversation_id))
-            # Write to temp file and upload as attachment, capturing the message
-            tmp_audio = tempfile.NamedTemporaryFile(suffix=audio_ext or ".mp3", delete=False)
-            try:
-                tmp_audio.write(audio_bytes)
-                tmp_audio.flush()
-                tmp_audio.close()
-                # Send the audio as a followup attachment and wait for the message
-                msg_with_audio = await interaction.followup.send(file=discord.File(tmp_audio.name), wait=True)
-                if msg_with_audio and getattr(msg_with_audio, "attachments", None):
-                    audio_url = msg_with_audio.attachments[0].url
-            finally:
-                try:
-                    os.remove(tmp_audio.name)
-                except Exception:
-                    logger.exception("Failed to remove temporary audio file: %s", tmp_audio.name)
-        except Exception as exc:
-            # Distinguish expected transient "audio not ready" exhaustion from other errors.
-            msg = str(exc or "")
-            if isinstance(exc, RuntimeError) and msg.startswith("Exhausted retries fetching conversation audio"):
-                # Expected transient case: warn but do not log a noisy traceback.
-                logger.warning("Conversation audio unavailable after retries for %s: %s", conversation_id, msg)
-            else:
-                # Unexpected: log full exception with traceback for diagnostics
-                logger.exception("Failed to download or upload conversation audio; proceeding without recording link")
-
-        # Deliver final transcript. If long, attach as a file
-        if len(transcript_text) <= 1900:
-            msg = f"Final transcript:\n\n{transcript_text}"
-            if audio_url:
-                msg += f"\n\nRecording: {audio_url}"
-            await interaction.followup.send(msg)
-        else:
-            tmp = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
-            tmp_path = tmp.name
-            try:
-                tmp.write(transcript_text.encode("utf-8"))
-                tmp.flush()
-                tmp.close()
-                header = "Final transcript (attached)."
-                if audio_url:
-                    header += f"\nRecording: {audio_url}"
-                await interaction.followup.send(header, file=discord.File(tmp_path))
-            finally:
-                try:
-                    os.remove(tmp_path)
-                except Exception:
-                    logger.exception("Failed to remove temporary transcript file: %s", tmp_path)
-
+        debug_note = " Debug mode: using your user id for assistant transcript entries." if debug else ""
+        await interaction.followup.send(
+            f"Ragebait session started in this channel using `{model}`. "
+            "Send messages and I will keep replying until the model marks the topic as off-topic."
+            f"{debug_note}"
+        )
     except Exception as exc:
         logger.exception("Unhandled error in /ragebait-mo")
         try:
