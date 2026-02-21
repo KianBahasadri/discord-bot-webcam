@@ -197,7 +197,9 @@ def redact_sensitive_media_inplace(image_path: str) -> dict[str, Any]:
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is required for webcam redaction.")
 
-    model = os.environ.get("OPENROUTER_REDACTION_MODEL") or os.environ.get("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+    model = os.environ.get("OPENROUTER_REDACTION_MODEL")
+    if not model:
+        raise RuntimeError("OPENROUTER_REDACTION_MODEL is required for webcam redaction.")
     max_side = int(os.environ.get("WEBCAM_REDACTION_MAX_SIDE", "1280"))
     padding_ratio = float(os.environ.get("WEBCAM_REDACTION_PADDING_RATIO", "0.08"))
     min_side_px = int(os.environ.get("WEBCAM_REDACTION_MIN_BOX_SIDE", "12"))

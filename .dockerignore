@@ -5,3 +5,6 @@ build/
 dist/
 .venv
 venv
+.git/
+.env
+PLAN.md

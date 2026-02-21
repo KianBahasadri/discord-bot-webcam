@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 PLAN.md
+.venv/
+venv/
+.pytest_cache/
