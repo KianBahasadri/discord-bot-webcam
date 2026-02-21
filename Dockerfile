@@ -14,6 +14,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py media_redaction.py ./
+COPY commands ./commands
 
 # Run as root to allow access to /dev/video0 and /dev/video2 by default. If you
 # prefer non-root, drop privileges and ensure the container user has permission
