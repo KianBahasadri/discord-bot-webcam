@@ -40,17 +40,17 @@ Environment
   `RAGEBAIT_MAX_TURNS` (default `40`),
   `RAGEBAIT_MAX_DURATION_SECONDS` (default `1800`),
   `RAGEBAIT_IDLE_TIMEOUT_SECONDS` (default `300`),
-  `RAGEBAIT_MO_BELIEFS_PATH` (default `/app/state/mo_beliefs.json`)
+  `RAGEBAIT_MO_BELIEFS_PATH` (default `/app/mo_beliefs.json`)
 
 Build and run with Docker
 
 1. Build the image:
    docker build -t discord-cam-bot .
 
-2. Run the container (ensure your host devices are available at /dev/video0 and /dev/video2; include /dev/snd for `/webcam` audio capture, and mount `./state` to persist Mo belief storage):
-   docker run --rm --env-file .env --device /dev/video0:/dev/video0 --device /dev/video2:/dev/video2 --device /dev/snd:/dev/snd -v "$(pwd)/state:/app/state" discord-cam-bot
+2. Run the container (ensure your host devices are available at /dev/video0 and /dev/video2; include /dev/snd for `/webcam` audio capture, and mount `./mo_beliefs.json` to persist Mo belief storage):
+   docker run --rm --env-file .env --device /dev/video0:/dev/video0 --device /dev/video2:/dev/video2 --device /dev/snd:/dev/snd -v "$(pwd)/mo_beliefs.json:/app/mo_beliefs.json" discord-cam-bot
 
-OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file maps /dev/video0, /dev/video2, /dev/snd, and `./state:/app/state`:
+OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file maps /dev/video0, /dev/video2, /dev/snd, and `./mo_beliefs.json:/app/mo_beliefs.json`:
    docker compose up --build
 
 Notes
@@ -59,5 +59,5 @@ Notes
 - `/webcam` captures from `/dev/video0` (laptop webcam), attempts a remote webcam capture over SSH, and captures from `/dev/video2` (HDMI capture card).
 - `/webcam` redacts each captured image before upload by blurring detected explicit content and visible PII (for example: phone numbers, API keys/tokens, and credit card numbers).
 - `/ragebait-mo` runs in-channel multi-turn chat mode using OpenRouter and stops when the model marks the conversation off-topic.
-- `/ragebait-mo` loads Mo beliefs from `state/mo_beliefs.json` (host-mounted). The model can emit optional `belief_updates` in JSON output; new beliefs are appended to this file automatically.
+- `/ragebait-mo` loads Mo beliefs from `mo_beliefs.json` (host-mounted). The model can emit optional `belief_updates` in JSON output; new beliefs are appended to this file automatically.
 - Errors (camera not available, failed capture, missing token) are sent as ephemeral messages to the invoking user.

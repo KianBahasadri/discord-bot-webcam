@@ -43,7 +43,7 @@ AUDIO_CAPTURE_FORMAT = "S16_LE"
 AUDIO_CAPTURE_GAIN_PERCENT = 100
 AUDIO_POST_GAIN_DB = 4.0
 RAGEBAIT_BELIEFS_PATH_ENV = "RAGEBAIT_MO_BELIEFS_PATH"
-RAGEBAIT_BELIEFS_PATH_DEFAULT = "/app/state/mo_beliefs.json"
+RAGEBAIT_BELIEFS_PATH_DEFAULT = "/app/mo_beliefs.json"
 
 
 def _extract_alsa_card_selector(audio_device: str) -> str:

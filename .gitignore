@@ -5,4 +5,4 @@ PLAN.md
 .venv/
 venv/
 .pytest_cache/
-state/mo_beliefs.json
+mo_beliefs.json

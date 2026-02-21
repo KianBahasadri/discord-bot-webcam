@@ -8,5 +8,5 @@ services:
       - "/dev/video2:/dev/video2"
       - "/dev/snd:/dev/snd"
     volumes:
-      - "./state:/app/state"
+      - "./mo_beliefs.json:/app/mo_beliefs.json"
     restart: always
