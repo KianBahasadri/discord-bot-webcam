@@ -33,23 +33,24 @@ Environment
   `WEBCAM_REDACTION_PROTECT_TIMESTAMP` (default `true`; ignores bottom-right timestamp strip),
   `WEBCAM_REDACTION_FAIL_CLOSED` (default `true`; if enabled, full-frame blur is used on model failure)
 - Required `/ragebait-mo` model env var:
-  `OPENROUTER_RAGEBAIT_MODEL` (required; example `deepseek/deepseek-v3.2`),
+  `OPENROUTER_RAGEBAIT_MODEL` (required; example `x-ai/grok-4.1-fast`),
   `MO_USER_ID` (required unless `/ragebait-mo debug:true`; limits replies/history to Mo only)
 - Optional `/ragebait-mo` tuning env vars:
   `RAGEBAIT_START_HISTORY_LIMIT` (default `60`),
   `RAGEBAIT_MAX_TURNS` (default `40`),
   `RAGEBAIT_MAX_DURATION_SECONDS` (default `1800`),
-  `RAGEBAIT_IDLE_TIMEOUT_SECONDS` (default `300`)
+  `RAGEBAIT_IDLE_TIMEOUT_SECONDS` (default `300`),
+  `RAGEBAIT_MO_BELIEFS_PATH` (default `/app/state/mo_beliefs.json`)
 
 Build and run with Docker
 
 1. Build the image:
    docker build -t discord-cam-bot .
 
-2. Run the container (ensure your host devices are available at /dev/video0 and /dev/video2; include /dev/snd for `/webcam` audio capture):
-   docker run --rm --env-file .env --device /dev/video0:/dev/video0 --device /dev/video2:/dev/video2 --device /dev/snd:/dev/snd discord-cam-bot
+2. Run the container (ensure your host devices are available at /dev/video0 and /dev/video2; include /dev/snd for `/webcam` audio capture, and mount `./state` to persist Mo belief storage):
+   docker run --rm --env-file .env --device /dev/video0:/dev/video0 --device /dev/video2:/dev/video2 --device /dev/snd:/dev/snd -v "$(pwd)/state:/app/state" discord-cam-bot
 
-OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file maps /dev/video0, /dev/video2, and /dev/snd into the container:
+OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file maps /dev/video0, /dev/video2, /dev/snd, and `./state:/app/state`:
    docker compose up --build
 
 Notes
@@ -58,4 +59,5 @@ Notes
 - `/webcam` captures from `/dev/video0` (laptop webcam), attempts a remote webcam capture over SSH, and captures from `/dev/video2` (HDMI capture card).
 - `/webcam` redacts each captured image before upload by blurring detected explicit content and visible PII (for example: phone numbers, API keys/tokens, and credit card numbers).
 - `/ragebait-mo` runs in-channel multi-turn chat mode using OpenRouter and stops when the model marks the conversation off-topic.
+- `/ragebait-mo` loads Mo beliefs from `state/mo_beliefs.json` (host-mounted). The model can emit optional `belief_updates` in JSON output; new beliefs are appended to this file automatically.
 - Errors (camera not available, failed capture, missing token) are sent as ephemeral messages to the invoking user.

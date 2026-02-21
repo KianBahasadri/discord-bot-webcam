@@ -7,4 +7,6 @@ services:
       - "/dev/video0:/dev/video0"
       - "/dev/video2:/dev/video2"
       - "/dev/snd:/dev/snd"
+    volumes:
+      - "./state:/app/state"
     restart: always

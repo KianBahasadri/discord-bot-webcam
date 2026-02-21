@@ -42,6 +42,8 @@ AUDIO_CAPTURE_CHANNELS = 2
 AUDIO_CAPTURE_FORMAT = "S16_LE"
 AUDIO_CAPTURE_GAIN_PERCENT = 100
 AUDIO_POST_GAIN_DB = 4.0
+RAGEBAIT_BELIEFS_PATH_ENV = "RAGEBAIT_MO_BELIEFS_PATH"
+RAGEBAIT_BELIEFS_PATH_DEFAULT = "/app/state/mo_beliefs.json"
 
 
 def _extract_alsa_card_selector(audio_device: str) -> str:
@@ -168,6 +170,85 @@ _ragebait_sessions: dict[int, dict[str, Any]] = {}
 _ragebait_locks: dict[int, asyncio.Lock] = {}
 
 
+def _ragebait_debug(message: str) -> None:
+    print(f"[ragebait-mo] {message}", flush=True)
+
+
+def _ragebait_beliefs_path() -> str:
+    path = os.environ.get(RAGEBAIT_BELIEFS_PATH_ENV, RAGEBAIT_BELIEFS_PATH_DEFAULT)
+    return str(path or RAGEBAIT_BELIEFS_PATH_DEFAULT)
+
+
+def _normalize_belief_text(raw: Any) -> str:
+    text = re.sub(r"\s+", " ", str(raw or "")).strip()
+    if len(text) > 240:
+        text = text[:240].rstrip()
+    return text
+
+
+def _write_ragebait_beliefs_file(beliefs: list[str]) -> None:
+    path = _ragebait_beliefs_path()
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"beliefs": beliefs}, f, ensure_ascii=False, indent=2)
+
+
+def _load_ragebait_beliefs() -> list[str]:
+    path = _ragebait_beliefs_path()
+    beliefs: list[str] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            raw_items = data.get("beliefs", [])
+        elif isinstance(data, list):
+            raw_items = data
+        else:
+            raw_items = []
+
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                normalized = _normalize_belief_text(item)
+                if normalized:
+                    beliefs.append(normalized)
+    except FileNotFoundError:
+        beliefs = []
+    except Exception as exc:
+        _ragebait_debug(f"beliefs load warning: path={path} error={exc}")
+        beliefs = []
+
+    return beliefs
+
+
+def _append_ragebait_beliefs(updates: list[str]) -> int:
+    incoming = []
+    for item in updates:
+        normalized = _normalize_belief_text(item)
+        if normalized:
+            incoming.append(normalized)
+    if not incoming:
+        return 0
+
+    existing = _load_ragebait_beliefs()
+    seen = {item.casefold() for item in existing}
+    added = 0
+    for item in incoming:
+        key = item.casefold()
+        if key in seen:
+            continue
+        existing.append(item)
+        seen.add(key)
+        added += 1
+
+    if added > 0:
+        _write_ragebait_beliefs_file(existing)
+
+    return added
+
+
 def _extract_json_object(text: str) -> str | None:
     start = text.find("{")
     if start < 0:
@@ -253,12 +334,25 @@ def _parse_ragebait_structured_output(raw_data: dict[str, Any]) -> dict[str, Any
 
     should_continue = bool(parsed.get("continue", False))
     ragebait = str(parsed.get("ragebait", "") or "").strip()
+    raw_updates = parsed.get("belief_updates", [])
+    belief_updates: list[str] = []
+    if isinstance(raw_updates, list):
+        seen_updates: set[str] = set()
+        for item in raw_updates:
+            normalized = _normalize_belief_text(item)
+            if not normalized:
+                continue
+            key = normalized.casefold()
+            if key in seen_updates:
+                continue
+            seen_updates.add(key)
+            belief_updates.append(normalized)
     if not should_continue:
         ragebait = ""
     if should_continue and not ragebait:
         should_continue = False
 
-    return {"continue": should_continue, "ragebait": ragebait}
+    return {"continue": should_continue, "ragebait": ragebait, "belief_updates": belief_updates}
 
 
 def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any]:
@@ -276,6 +370,11 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
 
     assistant_turns = _count_ragebait_assistant_turns(transcript)
     latest_user_len = _latest_user_message_length(transcript)
+    beliefs = _load_ragebait_beliefs()
+    beliefs_text = "\n".join(f"- {item}" for item in beliefs) if beliefs else "- (none)"
+    _ragebait_debug(
+        f"model request prepared: assistant_turns={assistant_turns} latest_user_len={latest_user_len} transcript_chars={len(transcript_text)} beliefs={len(beliefs)}"
+    )
 
     schema = {
         "name": "ragebait_turn",
@@ -285,6 +384,10 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
             "properties": {
                 "continue": {"type": "boolean"},
                 "ragebait": {"type": "string"},
+                "belief_updates": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
             },
             "required": ["continue", "ragebait"],
             "additionalProperties": False,
@@ -297,12 +400,7 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
         "about controversial Middle Eastern figures or events. "
         "The transcript includes recent channel history first, then live session turns; use that history to pick "
         "a relevant angle before replying. "
-        "Mo belief profile: "
-        "(1) Shah Reza Pahlavi was bad and a dictator, "
-        "(2) Khamenei and the Islamic Iranian regime are evil dictators, "
-        "(3) Saddam Hussein was an evil dictator, "
-        "(4) the new Syrian government led by Ahmed al-Sharaa are bad dictators, "
-        "(5) Benjamin Netanyahu is evil and bad. "
+        "Use the supplied 'Mo beliefs knowledge base' as factual profile context. "
         "Ragebait tactics: "
         "- Historical revisionist pivot: frame abuses as modernization side effects. "
         "- Western-puppet accusation: claim opposition mirrors Western propaganda. "
@@ -312,11 +410,17 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
         "- Keep the reply realistic and conversational, not cartoonish. "
         "- Keep reply length less than or equal to the latest user message length when possible. "
         "- For the first 3 assistant turns, the reply must be exactly one sentence. "
+        "- Escalate tone gradually across turns: start controlled, then become sharper and angrier as disagreement continues. "
+        "- Do not jump to maximum aggression immediately; increase intensity step by step. "
         "Continuation rules: "
         "- If assistant_turns_so_far is 0, this is the opening message right after command invocation; "
         "set continue=true and send an opening ragebait grounded in transcript history. "
         "- If the conversation drifts to unrelated topics, or the user asks to stop/end, set continue=false and ragebait=''. "
         "- If continuing, set continue=true and provide one provocative reply in ragebait. "
+        "Belief update rules: "
+        "- You may optionally include belief_updates as an array of concise, durable belief statements inferred from the transcript. "
+        "- Only include clear long-lived beliefs, not temporary emotions or one-off jokes. "
+        "- Use an empty array when there are no reliable new beliefs. "
         "Return JSON only matching the schema."
     )
 
@@ -330,6 +434,8 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
                     "Session metadata:\n"
                     f"assistant_turns_so_far: {assistant_turns}\n"
                     f"latest_user_message_length: {latest_user_len}\n\n"
+                    "Mo beliefs knowledge base:\n"
+                    f"{beliefs_text}\n\n"
                     f"Transcript (oldest to newest):\n{transcript_text}"
                 ),
             },
@@ -352,11 +458,16 @@ def _openrouter_ragebait_turn(transcript: list[dict[str, Any]]) -> dict[str, Any
         json=payload,
         timeout=90,
     )
+    _ragebait_debug(f"model response status={response.status_code}")
     if response.status_code >= 400:
         raise RuntimeError(f"OpenRouter error {response.status_code}: {response.text[:600]}")
 
     data = response.json()
-    return _parse_ragebait_structured_output(data)
+    parsed = _parse_ragebait_structured_output(data)
+    _ragebait_debug(
+        f"model parsed decision: continue={bool(parsed.get('continue'))} ragebait_len={len(str(parsed.get('ragebait', '') or ''))}"
+    )
+    return parsed
 
 
 def _ragebait_limits_exceeded(session: dict[str, Any]) -> str | None:
@@ -396,12 +507,15 @@ async def _end_ragebait_session(channel, channel_id: int, reason: str) -> None:
 async def _process_ragebait_turn(channel, channel_id: int) -> None:
     lock = _ragebait_locks.setdefault(channel_id, asyncio.Lock())
     async with lock:
+        _ragebait_debug(f"turn processing start: channel_id={channel_id}")
         session = _ragebait_sessions.get(channel_id)
         if not session or not session.get("active"):
+            _ragebait_debug(f"turn aborted: no active session channel_id={channel_id}")
             return
 
         limit_reason = _ragebait_limits_exceeded(session)
         if limit_reason:
+            _ragebait_debug(f"turn ended by limit: channel_id={channel_id} reason={limit_reason}")
             await _end_ragebait_session(channel, channel_id, limit_reason)
             return
 
@@ -410,25 +524,44 @@ async def _process_ragebait_turn(channel, channel_id: int) -> None:
         try:
             decision = await asyncio.to_thread(_openrouter_ragebait_turn, transcript)
         except Exception as exc:
+            _ragebait_debug(f"turn model error: channel_id={channel_id} error={exc}")
             logger.exception("Failed to generate ragebait turn")
             await channel.send(f"Ragebait session ended due to model error: {exc}")
             _ragebait_sessions.pop(channel_id, None)
             return
 
         if not decision.get("continue"):
+            updates = decision.get("belief_updates") or []
+            if updates:
+                try:
+                    added = await asyncio.to_thread(_append_ragebait_beliefs, updates)
+                    _ragebait_debug(f"belief updates saved before stop: channel_id={channel_id} proposed={len(updates)} added={added}")
+                except Exception as exc:
+                    _ragebait_debug(f"belief update save failed before stop: channel_id={channel_id} error={exc}")
             if is_opening_turn:
+                _ragebait_debug(f"opening turn invalid continue=false: channel_id={channel_id}")
                 await channel.send("Ragebait session ended due to model error: opening turn returned continue=false.")
                 _ragebait_sessions.pop(channel_id, None)
                 return
+            _ragebait_debug(f"turn requested stop by model: channel_id={channel_id}")
             await _end_ragebait_session(channel, channel_id, "model_stop")
             return
 
         reply = str(decision.get("ragebait", "") or "").strip()
         if not reply:
+            updates = decision.get("belief_updates") or []
+            if updates:
+                try:
+                    added = await asyncio.to_thread(_append_ragebait_beliefs, updates)
+                    _ragebait_debug(f"belief updates saved before empty-reply stop: channel_id={channel_id} proposed={len(updates)} added={added}")
+                except Exception as exc:
+                    _ragebait_debug(f"belief update save failed before empty-reply stop: channel_id={channel_id} error={exc}")
             if is_opening_turn:
+                _ragebait_debug(f"opening turn invalid empty reply: channel_id={channel_id}")
                 await channel.send("Ragebait session ended due to model error: opening turn returned empty ragebait.")
                 _ragebait_sessions.pop(channel_id, None)
                 return
+            _ragebait_debug(f"turn empty reply treated as stop: channel_id={channel_id}")
             await _end_ragebait_session(channel, channel_id, "model_stop")
             return
 
@@ -442,8 +575,12 @@ async def _process_ragebait_turn(channel, channel_id: int) -> None:
                 opening_prefix = f"<@{target_user_id}> "
 
         sent = await channel.send(f"{opening_prefix}{reply}")
+        _ragebait_debug(
+            f"turn reply sent: channel_id={channel_id} opening={is_opening_turn} reply_len={len(reply)}"
+        )
         session = _ragebait_sessions.get(channel_id)
         if not session or not session.get("active"):
+            _ragebait_debug(f"turn post-send session missing: channel_id={channel_id}")
             return
 
         session["turns"] = int(session.get("turns", 0)) + 1
@@ -460,6 +597,16 @@ async def _process_ragebait_turn(channel, channel_id: int) -> None:
                 "content": reply,
                 "timestamp": datetime.utcnow().isoformat(),
             }
+        )
+        updates = decision.get("belief_updates") or []
+        if updates:
+            try:
+                added = await asyncio.to_thread(_append_ragebait_beliefs, updates)
+                _ragebait_debug(f"belief updates saved: channel_id={channel_id} proposed={len(updates)} added={added}")
+            except Exception as exc:
+                _ragebait_debug(f"belief update save failed: channel_id={channel_id} error={exc}")
+        _ragebait_debug(
+            f"turn transcript updated: channel_id={channel_id} turns={session.get('turns')} transcript_items={len(session.get('transcript') or [])}"
         )
 
 
@@ -1103,7 +1250,11 @@ async def webcam(interaction: discord.Interaction):
 async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
     await interaction.response.defer()
     try:
+        _ragebait_debug(
+            f"command invoked: channel_id={getattr(interaction, 'channel_id', None)} user_id={getattr(getattr(interaction, 'user', None), 'id', None)} debug={bool(debug)}"
+        )
         if not os.environ.get("OPENROUTER_API_KEY"):
+            _ragebait_debug("command abort: OPENROUTER_API_KEY missing")
             await interaction.followup.send("OPENROUTER_API_KEY is required for /ragebait-mo.", ephemeral=True)
             return
 
@@ -1114,12 +1265,14 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
 
         channel_id = getattr(channel, "id", None)
         if channel_id is None:
+            _ragebait_debug("command abort: missing channel id")
             await interaction.followup.send("Error: channel is missing an id.", ephemeral=True)
             return
 
         invoker_id = str(getattr(getattr(interaction, "user", None), "id", "") or "")
         target_user_id = invoker_id if debug else str(os.environ.get("MO_USER_ID", "") or "")
         if not target_user_id:
+            _ragebait_debug("command abort: MO_USER_ID missing in non-debug mode")
             await interaction.followup.send("MO_USER_ID is required for /ragebait-mo when debug=false.", ephemeral=True)
             return
 
@@ -1149,7 +1302,11 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
                             "timestamp": datetime.utcnow().isoformat(),
                         }
                     )
+                _ragebait_debug(
+                    f"history seeded: channel_id={channel_id} scanned={len(recent)} kept={len(transcript)} target_user_id={target_user_id}"
+                )
             except discord.Forbidden:
+                _ragebait_debug(f"command abort: missing history permission channel_id={channel_id}")
                 await interaction.followup.send(
                     "I can't read message history in this channel. Please grant Read Message History.",
                     ephemeral=True,
@@ -1170,15 +1327,20 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
             "target_user_id": target_user_id,
             "debug": bool(debug),
         }
+        _ragebait_debug(
+            f"session started: channel_id={channel_id} target_user_id={target_user_id} debug={bool(debug)} transcript_items={len(transcript)}"
+        )
 
         model = os.environ.get("OPENROUTER_RAGEBAIT_MODEL")
         if not model:
+            _ragebait_debug("command abort: OPENROUTER_RAGEBAIT_MODEL missing")
             await interaction.followup.send(
                 "OPENROUTER_RAGEBAIT_MODEL is required for /ragebait-mo.",
                 ephemeral=True,
             )
             return
         if debug:
+            _ragebait_debug(f"debug session awaiting user messages: channel_id={channel_id}")
             await interaction.followup.send(
                 f"Ragebait session started in debug mode using `{model}`. "
                 "Debug mode: assistant transcript entries use your user id. "
@@ -1186,8 +1348,10 @@ async def ragebait_mo(interaction: discord.Interaction, debug: bool = False):
             )
             return
 
+        _ragebait_debug(f"non-debug opening turn dispatch: channel_id={channel_id}")
         await _process_ragebait_turn(channel, channel_id)
     except Exception as exc:
+        _ragebait_debug(f"command exception: {exc}")
         logger.exception("Unhandled error in /ragebait-mo")
         try:
             await interaction.followup.send(f"Error running /ragebait-mo: {exc}", ephemeral=True)
