@@ -13,7 +13,11 @@ import discord
 logger = logging.getLogger(__name__)
 
 
-async def _delete_most_recent_bot_message(channel: Any, client: discord.Client) -> dict:
+async def _delete_most_recent_bot_message(
+    channel: Any,
+    client: discord.Client,
+    skip_message_id: int | None = None,
+) -> dict:
     """Delete the most recent message authored by the bot in the channel.
 
     Returns a dict with keys: deleted(bool), message_id(optional), error(optional).
@@ -25,6 +29,9 @@ async def _delete_most_recent_bot_message(channel: Any, client: discord.Client) 
             return {"deleted": False, "message_id": None, "error": "bot_not_ready"}
         # Iterate recent messages (newest first)
         async for msg in channel.history(limit=200):
+            if skip_message_id is not None and getattr(msg, "id", None) == skip_message_id:
+                continue
+
             if getattr(msg, "author", None) and getattr(msg.author, "id", None) == client.user.id:
                 try:
                     await msg.delete()
@@ -59,21 +66,29 @@ def register(tree: discord.app_commands.CommandTree, client: discord.Client) -> 
 
         Provides concise user-facing messages and handles permission errors.
         """
+        # Keep acknowledgement public, but skip deleting that placeholder message.
         await interaction.response.defer()
         channel = interaction.channel
         if channel is None:
-            await interaction.followup.send("Error: could not determine channel.", ephemeral=True)
+            await interaction.followup.send("Error: could not determine channel.")
             return
 
-        result = await _delete_most_recent_bot_message(channel, client)
+        original_response = await interaction.original_response()
+        original_response_id = getattr(original_response, "id", None)
+
+        result = await _delete_most_recent_bot_message(
+            channel,
+            client,
+            skip_message_id=original_response_id,
+        )
         if result.get("deleted"):
-            await interaction.followup.send("Deleted most recent bot message.", ephemeral=True)
+            await interaction.followup.send("Deleted most recent bot message.")
             return
 
         err = result.get("error") or "unknown"
         if err == "none_found":
-            await interaction.followup.send("No recent bot message to delete.", ephemeral=True)
+            await interaction.followup.send("No recent bot message to delete.")
         elif err == "forbidden":
-            await interaction.followup.send("I lack permission to delete messages in this channel.", ephemeral=True)
+            await interaction.followup.send("I lack permission to delete messages in this channel.")
         else:
-            await interaction.followup.send(f"Failed to delete bot message: {err}", ephemeral=True)
+            await interaction.followup.send(f"Failed to delete bot message: {err}")
