@@ -8,4 +8,5 @@ venv
 .git/
 .env
 PLAN.md
-mo_beliefs.json
+mo_beliefs*.json
+state/
