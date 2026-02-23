@@ -23,6 +23,7 @@ from discord import app_commands
 from commands import webcam as webcam_cmd
 from commands import delete as delete_cmd
 from commands import ragebait_mo as ragebait_cmd
+from commands import heart_rate as heart_rate_cmd
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -92,6 +93,13 @@ class CamBot(discord.Client):
     async def setup_hook(self) -> None:
         # Preserve startup audio gain behavior from original bot.
         await asyncio.to_thread(_set_audio_gain_on_startup)
+
+        # Start heart-rate background monitor if configured.
+        try:
+            heart_rate_cmd.bind_client(self)
+            await heart_rate_cmd.start_background_monitor()
+        except Exception:
+            logger.exception("Failed to initialize heart-rate monitor")
 
         # Register command modules. Each module should expose register(tree, client).
         try:

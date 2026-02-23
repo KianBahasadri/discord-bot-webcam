@@ -9,4 +9,5 @@ services:
       - "/dev/snd:/dev/snd"
     volumes:
       - "./mo_beliefs.json:/app/mo_beliefs.json"
+      - "/run/dbus/system_bus_socket:/run/dbus/system_bus_socket"
     restart: always

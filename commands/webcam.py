@@ -24,6 +24,7 @@ from typing import Any, Callable, Optional
 import discord
 import asyncio
 from media_redaction import redact_sensitive_media_inplace
+from . import heart_rate
 
 try:
     import cv2
@@ -541,7 +542,7 @@ def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -
     async def webcam(interaction: discord.Interaction):
         """Slash command handler: capture local webcam, remote webcam, and HDMI screenshot."""
         await interaction.response.defer()
-        # Trigger a fire-and-forget audio capture/send helper exactly once per /webcam invocation.
+        # Trigger fire-and-forget helpers exactly once per /webcam invocation.
         try:
             channel_id = None
             interaction_channel = getattr(interaction, "channel", None)
@@ -561,8 +562,13 @@ def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -
                     asyncio.create_task(_webcam_audio_capture_and_send(channel_id, duration_s=duration))
                 except Exception:
                     logger.exception("Failed to create background task for webcam audio helper")
+                try:
+                    if heart_rate.is_enabled():
+                        asyncio.create_task(heart_rate.send_webcam_heart_rate(channel_id))
+                except Exception:
+                    logger.exception("Failed to create background task for webcam heart-rate helper")
         except Exception:
-            logger.exception("Unexpected error scheduling webcam audio helper")
+            logger.exception("Unexpected error scheduling webcam background helpers")
 
         tmp_paths = []
         try:

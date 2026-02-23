@@ -23,7 +23,8 @@ Environment
   `REMOTE_WEBCAM_TIMEOUT_SECONDS` (default `12`),
   `REMOTE_WEBCAM_WARMUP_FRAMES` (default `30`),
   `REMOTE_WEBCAM_WARMUP_FPS` (default `15`),
-  `REMOTE_WEBCAM_SETTLE_SECONDS` (default `0.4`)
+  `REMOTE_WEBCAM_SETTLE_SECONDS` (default `0.4`),
+  `HEART_RATE_DEVICE_ADDRESS` (for `/webcam` heart-rate side message; example `F8:AF:75:80:4A:48`)
 - Required `/webcam` redaction model env var:
   `OPENROUTER_REDACTION_MODEL` (required; example `google/gemini-2.5-flash`),
   `WEBCAM_REDACTION_TIMEOUT_SECONDS` (default `30`),
@@ -47,16 +48,17 @@ Build and run with Docker
 1. Build the image:
    docker build -t discord-cam-bot .
 
-2. Run the container (ensure your host devices are available at /dev/video0 and /dev/video2; include /dev/snd for `/webcam` audio capture, and mount `./mo_beliefs.json` to persist Mo belief storage):
-   docker run --rm --env-file .env --device /dev/video0:/dev/video0 --device /dev/video2:/dev/video2 --device /dev/snd:/dev/snd -v "$(pwd)/mo_beliefs.json:/app/mo_beliefs.json" discord-cam-bot
+2. Run the container (ensure your host devices are available at /dev/video0 and /dev/video2; include /dev/snd for `/webcam` audio capture, mount host D-Bus socket for BLE heart-rate access, and mount `./mo_beliefs.json` to persist Mo belief storage):
+   docker run --rm --env-file .env --device /dev/video0:/dev/video0 --device /dev/video2:/dev/video2 --device /dev/snd:/dev/snd -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket -v "$(pwd)/mo_beliefs.json:/app/mo_beliefs.json" discord-cam-bot
 
-OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file maps /dev/video0, /dev/video2, /dev/snd, and `./mo_beliefs.json:/app/mo_beliefs.json`:
+OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file maps /dev/video0, /dev/video2, /dev/snd, `/run/dbus/system_bus_socket`, and `./mo_beliefs.json:/app/mo_beliefs.json`:
    docker compose up --build
 
 Notes
 - The bot registers global slash commands on startup (`/webcam`, `/ragebait-mo`). It may take a few minutes to appear in all guilds.
 - The bot uses opencv-python-headless to capture a single frame and sends it as a JPEG with no caption.
 - `/webcam` captures from `/dev/video0` (laptop webcam), attempts a remote webcam capture over SSH, and captures from `/dev/video2` (HDMI capture card).
+- `/webcam` also sends a standalone heart-rate message (for example `❤️ Heart rate: 72 bpm`) when `HEART_RATE_DEVICE_ADDRESS` is configured.
 - `/webcam` redacts each captured image before upload by blurring detected explicit content and visible PII (for example: phone numbers, API keys/tokens, and credit card numbers).
 - `/ragebait-mo` runs in-channel multi-turn chat mode using OpenRouter and stops when the model marks the conversation off-topic.
 - `/ragebait-mo` loads Mo beliefs from `mo_beliefs.json` (host-mounted). The model can emit optional `belief_updates` in JSON output; new beliefs are appended to this file automatically.
