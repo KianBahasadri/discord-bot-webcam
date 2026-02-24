@@ -148,7 +148,7 @@ class CamBot(discord.Client):
         logger.info("Command tree synced to allowed guilds: %s", sorted(ALLOWED_GUILD_IDS))
 
     async def on_message(self, message: discord.Message) -> None:
-        if not _is_allowed_guild_id(getattr(message, "guild_id", None)):
+        if not _is_allowed_guild_id(getattr(getattr(message, "guild", None), "id", None)):
             return
 
         # Delegate per-message handling to ragebait_mo.handle_message
