@@ -19,7 +19,12 @@ import time
 import subprocess
 import shlex
 import shutil
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
+import json
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+import requests
+from datetime import timezone, timedelta
 
 import discord
 import asyncio
@@ -37,6 +42,600 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 logger = logging.getLogger(__name__)
+
+
+# Linear GraphQL helper constants and defaults
+LINEAR_GRAPHQL_ENDPOINT = os.environ.get("LINEAR_GRAPHQL_ENDPOINT", "https://api.linear.app/graphql")
+LINEAR_SUMMARY_ENABLED_DEFAULT = True
+LINEAR_DEFAULT_STATUSES = ["In Progress", "Todo"]
+LINEAR_DEFAULT_LOOKAHEAD_DAYS = 3
+
+
+class LinearError(Exception):
+    """Base exception for Linear-related failures."""
+
+
+class LinearFetchError(LinearError):
+    """Raised when fetching data from Linear fails in a non-ambiguous way."""
+
+
+def _get_linear_env_defaults() -> Tuple[List[str], int]:
+    """Read env-configurable defaults for linear filtering.
+
+    - LINEAR_STATUSES: comma-separated status names (default: "In Progress,Todo")
+    - LINEAR_LOOKAHEAD_DAYS: integer number of days to look ahead (default: 3)
+    """
+    default_statuses_csv = ",".join(LINEAR_DEFAULT_STATUSES)
+    raw_statuses = os.environ.get("LINEAR_STATUSES", default_statuses_csv)
+    # split on comma and strip whitespace, ignore empty entries
+    statuses = [s.strip() for s in raw_statuses.split(",") if s.strip()]
+    try:
+        lookahead = int(os.environ.get("LINEAR_LOOKAHEAD_DAYS", str(LINEAR_DEFAULT_LOOKAHEAD_DAYS)))
+    except Exception:
+        lookahead = LINEAR_DEFAULT_LOOKAHEAD_DAYS
+    return statuses, max(0, lookahead)
+
+
+@dataclass
+class LinearIssue:
+    identifier: Optional[str]
+    title: Optional[str]
+    priority: Optional[int]
+    due_date: Optional[datetime]
+    state_name: Optional[str]
+    state_type: Optional[str]
+    assignee_name: Optional[str]
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+    updated_at: Optional[datetime]
+    project_name: Optional[str]
+    url: Optional[str]
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        # Normalize trailing Z to +00:00 for fromisoformat
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        # Try date-only format
+        try:
+            parsed = datetime.fromisoformat(value + "T00:00:00+00:00")
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except Exception:
+            logger.debug("Failed to parse ISO datetime: %s", value)
+            return None
+
+
+def _issue_node_key(node: Dict) -> str:
+    identifier = str(node.get("identifier") or "").strip()
+    if identifier:
+        return f"id:{identifier}"
+    url = str(node.get("url") or "").strip()
+    if url:
+        return f"url:{url}"
+    title = str(node.get("title") or "").strip()
+    updated_at = str(node.get("updatedAt") or "").strip()
+    return f"fallback:{title}:{updated_at}"
+
+
+def _node_to_issue(node: Dict) -> LinearIssue:
+    return LinearIssue(
+        identifier=node.get("identifier"),
+        title=node.get("title"),
+        priority=node.get("priority"),
+        due_date=_parse_iso_datetime(node.get("dueDate")),
+        state_name=(node.get("state") or {}).get("name"),
+        state_type=(node.get("state") or {}).get("type"),
+        assignee_name=(node.get("assignee") or {}).get("name"),
+        started_at=_parse_iso_datetime(node.get("startedAt")),
+        completed_at=_parse_iso_datetime(node.get("completedAt")),
+        updated_at=_parse_iso_datetime(node.get("updatedAt")),
+        project_name=(node.get("project") or {}).get("name"),
+        url=node.get("url"),
+    )
+
+
+def _issue_to_dict(issue: LinearIssue) -> Dict:
+    """Convert LinearIssue to a JSON-serializable dict used by summary helpers."""
+    def iso_or_none(dt: Optional[datetime]) -> Optional[str]:
+        if dt is None:
+            return None
+        try:
+            return dt.astimezone(timezone.utc).isoformat()
+        except Exception:
+            return dt.isoformat()
+
+    return {
+        "id": issue.identifier,
+        "title": issue.title,
+        "priority": issue.priority,
+        "dueDate": iso_or_none(issue.due_date),
+        "state": issue.state_name,
+        "stateType": issue.state_type,
+        "assignee": issue.assignee_name,
+        "startedAt": iso_or_none(issue.started_at),
+        "completedAt": iso_or_none(issue.completed_at),
+        "updatedAt": iso_or_none(issue.updated_at),
+        "project": issue.project_name,
+        "url": issue.url,
+    }
+
+
+def fetch_linear_issues(statuses: Optional[List[str]] = None, lookahead_days: Optional[int] = None, page_size: int = 100, max_total: int = 2000) -> List[Dict]:
+    """Fetch issues from Linear GraphQL matching: (state in statuses) OR (dueDate < now + lookahead_days).
+
+    Returns a list of issue dicts (raw GraphQL node dicts). This function handles pagination
+    and includes several fail-soft fallbacks with clear errors.
+    """
+    resolved_statuses: List[str]
+    resolved_lookahead_days: int
+    if statuses is None or not statuses:
+        resolved_statuses, _la = _get_linear_env_defaults()
+    else:
+        resolved_statuses = [s for s in statuses if isinstance(s, str) and s.strip()]
+        if not resolved_statuses:
+            resolved_statuses, _la = _get_linear_env_defaults()
+
+    if lookahead_days is None:
+        _st, resolved_lookahead_days = _get_linear_env_defaults()
+    else:
+        resolved_lookahead_days = max(0, int(lookahead_days))
+
+    token = os.environ.get("LINEAR_API_KEY")
+    if not token:
+        raise LinearFetchError("Missing LINEAR_API_KEY environment variable; cannot fetch Linear data.")
+
+    # Linear docs expect the API key to be sent as-is in the Authorization header
+    # (Authorization: <API_KEY>). If a user mistakenly provided a Bearer-prefixed
+    # value, strip it so we follow the docs.
+    normalized_token = token.strip()
+    if normalized_token.lower().startswith("bearer "):
+        normalized_token = normalized_token[7:].strip()
+
+    headers = {
+        "Authorization": normalized_token,
+        "Content-Type": "application/json",
+    }
+
+    # Server-side dueDate filter: use a relative ISO duration (P{days}D) so the
+    # GraphQL filter is evaluated server-side rather than embedding a concrete timestamp.
+    now = datetime.now(timezone.utc)
+    due_period = f"P{resolved_lookahead_days}D"
+
+    # Build a GraphQL-friendly array for statuses
+    statuses_list = ", ".join(json.dumps(s) for s in resolved_statuses)
+
+    # Query template (we inline statuses and due threshold for simplicity)
+    base_query = f"""
+query Issues($first: Int, $after: String) {{
+  issues(first: $first, after: $after, filter: {{ or: [ {{ state: {{ name: {{ in: [{statuses_list}] }} }} }}, {{ dueDate: {{ lt: \"{due_period}\" }} }} ] }}) {{
+    nodes {{
+      identifier
+      title
+      priority
+      dueDate
+      startedAt
+      completedAt
+      updatedAt
+      url
+      state {{ name type }}
+      assignee {{ name }}
+      project {{ name }}
+    }}
+    pageInfo {{ hasNextPage endCursor }}
+  }}
+}}
+"""
+
+    issues: List[Dict] = []
+    after = None
+    total_retrieved = 0
+
+    session = requests.Session()
+
+    try:
+        # Primary attempt: server-side OR filter
+        while True:
+            payload = {"query": base_query, "variables": {"first": page_size, "after": after}}
+            resp = session.post(LINEAR_GRAPHQL_ENDPOINT, headers=headers, json=payload, timeout=15)
+            if resp.status_code != 200:
+                # Surface helpful message
+                raise LinearFetchError(f"Linear API returned HTTP {resp.status_code}: {resp.text}")
+
+            data = resp.json()
+            if data.get("errors"):
+                # Bail out to fallback behavior (server-side filter might be unsupported)
+                raise LinearFetchError(f"Linear GraphQL errors: {data.get('errors')}")
+
+            issues_nodes = data.get("data", {}).get("issues", {}).get("nodes", [])
+            for n in issues_nodes:
+                issues.append(n)
+                total_retrieved += 1
+                if total_retrieved >= max_total:
+                    logger.warning("Reached max_total (%s) while fetching Linear issues; truncating results.", max_total)
+                    return issues
+
+            page_info = data.get("data", {}).get("issues", {}).get("pageInfo", {})
+            if not page_info.get("hasNextPage"):
+                break
+            after = page_info.get("endCursor")
+
+        return issues
+
+    except LinearFetchError as exc:
+        logger.warning("Primary Linear fetch failed (%s). Attempting fallback fetch methods.", exc)
+        # Fallback 1: use two server-side filters and merge so OR semantics are preserved.
+        try:
+            statuses_list = ", ".join(json.dumps(s) for s in resolved_statuses)
+            state_query = f"""
+query IssuesByState($first: Int, $after: String) {{
+  issues(first: $first, after: $after, filter: {{ state: {{ name: {{ in: [{statuses_list}] }} }} }}) {{
+    nodes {{ identifier title priority dueDate startedAt completedAt updatedAt url state {{ name type }} assignee {{ name }} project {{ name }} }}
+    pageInfo {{ hasNextPage endCursor }}
+  }}
+}}
+"""
+
+            due_query = f"""
+query IssuesByDue($first: Int, $after: String) {{
+  issues(first: $first, after: $after, filter: {{ dueDate: {{ lt: \"{due_period}\" }} }}) {{
+    nodes {{ identifier title priority dueDate startedAt completedAt updatedAt url state {{ name type }} assignee {{ name }} project {{ name }} }}
+    pageInfo {{ hasNextPage endCursor }}
+  }}
+}}
+"""
+
+            merged_issues: Dict[str, Dict] = {}
+            after = None
+            while True:
+                payload = {"query": state_query, "variables": {"first": page_size, "after": after}}
+                resp = session.post(LINEAR_GRAPHQL_ENDPOINT, headers=headers, json=payload, timeout=15)
+                if resp.status_code != 200:
+                    raise LinearFetchError(f"Linear API returned HTTP {resp.status_code}: {resp.text}")
+                data = resp.json()
+                if data.get("errors"):
+                    raise LinearFetchError(f"Linear GraphQL errors on fallback: {data.get('errors')}")
+                nodes = data.get("data", {}).get("issues", {}).get("nodes", [])
+                for n in nodes:
+                    key = _issue_node_key(n)
+                    if key not in merged_issues:
+                        merged_issues[key] = n
+                        total_retrieved += 1
+                        if total_retrieved >= max_total:
+                            logger.warning("Reached max_total (%s) during fallback fetch; truncating results.", max_total)
+                            return list(merged_issues.values())
+                page_info = data.get("data", {}).get("issues", {}).get("pageInfo", {})
+                if not page_info.get("hasNextPage"):
+                    break
+                after = page_info.get("endCursor")
+
+            after = None
+            while True:
+                payload = {"query": due_query, "variables": {"first": page_size, "after": after}}
+                resp = session.post(LINEAR_GRAPHQL_ENDPOINT, headers=headers, json=payload, timeout=15)
+                if resp.status_code != 200:
+                    raise LinearFetchError(f"Linear API returned HTTP {resp.status_code}: {resp.text}")
+                data = resp.json()
+                if data.get("errors"):
+                    raise LinearFetchError(f"Linear GraphQL errors on due-date fallback: {data.get('errors')}")
+                nodes = data.get("data", {}).get("issues", {}).get("nodes", [])
+                for n in nodes:
+                    key = _issue_node_key(n)
+                    if key not in merged_issues:
+                        merged_issues[key] = n
+                        total_retrieved += 1
+                        if total_retrieved >= max_total:
+                            logger.warning("Reached max_total (%s) during due-date fallback; truncating results.", max_total)
+                            return list(merged_issues.values())
+                page_info = data.get("data", {}).get("issues", {}).get("pageInfo", {})
+                if not page_info.get("hasNextPage"):
+                    break
+                after = page_info.get("endCursor")
+
+            return list(merged_issues.values())
+        except LinearFetchError as exc2:
+            logger.warning("State-only fallback failed: %s", exc2)
+            # Final fallback: fetch without server-side filter and filter client-side (bounded)
+            try:
+                raw_query = """
+query AllIssues($first: Int, $after: String) {
+  issues(first: $first, after: $after) {
+    nodes { identifier title priority dueDate startedAt completedAt updatedAt url state { name type } assignee { name } project { name } }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+"""
+                issues = []
+                after = None
+                total_retrieved = 0
+                capped = False
+                while True:
+                    payload = {"query": raw_query, "variables": {"first": page_size, "after": after}}
+                    resp = session.post(LINEAR_GRAPHQL_ENDPOINT, headers=headers, json=payload, timeout=15)
+                    if resp.status_code != 200:
+                        raise LinearFetchError(f"Linear API returned HTTP {resp.status_code}: {resp.text}")
+                    data = resp.json()
+                    if data.get("errors"):
+                        raise LinearFetchError(f"Linear GraphQL errors on final fallback: {data.get('errors')}")
+                    nodes = data.get("data", {}).get("issues", {}).get("nodes", [])
+                    for n in nodes:
+                        issues.append(n)
+                        total_retrieved += 1
+                        if total_retrieved >= max_total:
+                            logger.warning("Reached max_total (%s) during final fallback; truncating results.", max_total)
+                            capped = True
+                            break
+                    if capped:
+                        break
+                    page_info = data.get("data", {}).get("issues", {}).get("pageInfo", {})
+                    if not page_info.get("hasNextPage"):
+                        break
+                    after = page_info.get("endCursor")
+
+                # client-side filter to match requested expression
+                due_limit = now + timedelta(days=resolved_lookahead_days)
+                filtered = []
+                for n in issues:
+                    state_name = (n.get("state") or {}).get("name")
+                    due = _parse_iso_datetime(n.get("dueDate"))
+                    if (state_name in resolved_statuses) or (due is not None and due <= due_limit):
+                        filtered.append(n)
+                return filtered
+            except LinearFetchError as final_exc:
+                raise LinearFetchError(f"All Linear fetch attempts failed: {final_exc}")
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+
+def compute_linear_summary(raw_nodes: List[Dict], lookahead_days: Optional[int] = None, representative_limit: int = 5) -> Dict:
+    """Compute summary metrics from raw GraphQL issue nodes.
+
+    Returns a dict with counts and representative lists for:
+      - behind (past due and not completed)
+      - upcoming (due within lookahead and not completed)
+      - completed_this_week (completed within last 7 days)
+
+    NOTE: For "completed_this_week" we use a 7-day lookback window (assumption).
+    """
+    resolved_lookahead_days: int
+    if lookahead_days is None:
+        _, resolved_lookahead_days = _get_linear_env_defaults()
+    else:
+        resolved_lookahead_days = max(0, int(lookahead_days))
+
+    issues = [_node_to_issue(n) for n in raw_nodes]
+    now = datetime.now(timezone.utc)
+    lookahead_limit = now + timedelta(days=resolved_lookahead_days)
+    week_ago = now - timedelta(days=7)
+
+    behind = []
+    upcoming = []
+    completed = []
+
+    for iss in issues:
+        completed_at = iss.completed_at
+        due = iss.due_date
+
+        if completed_at and completed_at >= week_ago:
+            completed.append(iss)
+
+        # only consider open issues for behind/upcoming (no completedAt)
+        if not completed_at:
+            if due and due < now:
+                behind.append(iss)
+            elif due and now <= due <= lookahead_limit:
+                upcoming.append(iss)
+
+    # Sort representative lists: behind by oldest due, upcoming by nearest due, completed by most recent
+    behind_sorted = sorted(behind, key=lambda i: (i.due_date or datetime.max))
+    upcoming_sorted = sorted(upcoming, key=lambda i: (i.due_date or datetime.max))
+    completed_sorted = sorted(completed, key=lambda i: (i.completed_at or datetime.min), reverse=True)
+
+    summary = {
+        "counts": {
+            "behind": len(behind),
+            "upcoming": len(upcoming),
+            "completed_this_week": len(completed),
+            "total_fetched": len(issues),
+        },
+        "items": {
+            "behind": [_issue_to_dict(i) for i in behind_sorted[:representative_limit]],
+            "upcoming": [_issue_to_dict(i) for i in upcoming_sorted[:representative_limit]],
+            "completed_this_week": [_issue_to_dict(i) for i in completed_sorted[:representative_limit]],
+        },
+        "meta": {
+            "lookahead_days": resolved_lookahead_days,
+            "generated_at": now.isoformat(),
+        },
+    }
+    return summary
+
+
+def _extract_openrouter_choice_text(data: Dict) -> str:
+    """Extract plain text from an OpenRouter chat/completions response.
+
+    Handles a few shapes the API may return (string, dict, or list parts).
+    """
+    choices = data.get("choices") or []
+    if not choices:
+        return ""
+
+    message = (choices[0] or {}).get("message") or {}
+    content = message.get("content")
+
+    # content can be a list of parts, a string, or a dict with 'text'
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                parts.append(str(part.get("text") or part.get("content") or ""))
+            else:
+                parts.append(str(part))
+        text = "".join(parts)
+    elif isinstance(content, dict):
+        # Some adapters embed text under 'text' or nested keys
+        text = str(content.get("text") or content.get("message") or json.dumps(content))
+    else:
+        text = str(content or "")
+
+    return text.strip()
+
+
+def _linear_summary_fallback_text(summary: Dict, flavor: Optional[str] = None) -> str:
+    """Deterministic fallback if the model call fails.
+
+    Produces a short plaintext summary grounded in the numeric counts from summary.
+    """
+    counts = (summary or {}).get("counts", {}) or {}
+    behind = int(counts.get("behind", 0) or 0)
+    upcoming = int(counts.get("upcoming", 0) or 0)
+    completed = int(counts.get("completed_this_week", 0) or 0)
+    total = int(counts.get("total_fetched", 0) or 0)
+    lookahead = (summary or {}).get("meta", {}).get("lookahead_days")
+
+    # Simple deterministic phrasing — keep it short
+    if behind > max(0, completed):
+        # Negative performance
+        if lookahead is None:
+            return f"Kian status: {behind} overdue, {upcoming} due soon, {completed} completed this week. It's a mess — priorities need attention."
+        return f"Kian status: {behind} overdue, {upcoming} due in the next {lookahead}d, {completed} completed this week. It's a mess — priorities need attention."
+    else:
+        # Non-negative / positive
+        if lookahead is None:
+            return f"Kian status: {completed} completed this week, {upcoming} upcoming, {behind} overdue (of {total} fetched). Nice momentum!"
+        return f"Kian status: {completed} completed this week, {upcoming} upcoming in the next {lookahead}d, {behind} overdue (of {total}). Nice momentum!"
+
+
+def _openrouter_linear_summary(summary: Dict, flavor: Optional[str] = None, max_chars: int = 1800) -> str:
+    """Generate a short, stylized Linear status summary via OpenRouter (Grok).
+
+    This helper mirrors the request style used in commands/ragebait_mo.py: it POSTs to
+    https://openrouter.ai/api/v1/chat/completions with the Authorization Bearer token and
+    HTTP-Referer / X-Title headers. If anything goes wrong, a deterministic fallback is
+    returned instead of raising.
+
+    Note: this function is intentionally reusable and is not wired into the /palantir
+    command path yet.
+    """
+    try:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            logger.warning("OPENROUTER_API_KEY not set; returning fallback summary.")
+            return _linear_summary_fallback_text(summary, flavor=flavor)
+
+        model = os.environ.get("OPENROUTER_LINEAR_SUMMARY_MODEL", "x-ai/grok-4.1-fast")
+
+        system_prompt = (
+            "You are an assistant whose job is to tell Kian's current project status to his "
+            "friends based ONLY on the provided Linear data. Be entertaining and concise. "
+            "Output plain text only (no markdown, no code fences), about 2-4 sentences. "
+            "Make it lively and human: if the numeric facts show problems (more overdue than "
+            "completed this week or obvious regression), adopt a frustrated tone — light profanity is allowed. "
+            "If performance looks good, be celebratory but still punchy. Always ground claims in the provided facts and do NOT invent new facts or URLs."
+        )
+
+        # Provide the model the raw JSON summary and a short human-friendly bullet list
+        try:
+            summary_json = json.dumps(summary, ensure_ascii=False, indent=2)
+        except Exception:
+            summary_json = str(summary)
+
+        counts = (summary or {}).get("counts", {}) or {}
+        behind = int(counts.get("behind", 0) or 0)
+        upcoming = int(counts.get("upcoming", 0) or 0)
+        completed = int(counts.get("completed_this_week", 0) or 0)
+        total = int(counts.get("total_fetched", 0) or 0)
+        lookahead = (summary or {}).get("meta", {}).get("lookahead_days")
+
+        brief = (
+            f"Counts: behind={behind}, upcoming={upcoming}, completed_this_week={completed}, total={total}."
+        )
+
+        if lookahead is not None:
+            brief += f" Lookahead_days={lookahead}."
+
+        user_text = (
+            "Use only the facts below to write the short status update for Kian's friends. "
+            "Aim for a couple of sentences so it's easy to read in Discord. "
+            f"Requested flavor: {flavor or 'casual'}\n\n"
+            "BRIEF_FACTS:\n"
+            f"{brief}\n\n"
+            "REPRESENTATIVE_ITEMS (showing title, id, project when available):\n"
+        )
+
+        # Append representative items in a compact form
+        items = (summary or {}).get("items", {}) or {}
+        for section in ("behind", "upcoming", "completed_this_week"):
+            rep = items.get(section) or []
+            if rep:
+                user_text += f"{section}:\n"
+                for it in rep[:5]:
+                    tid = it.get("id") or ""
+                    title = (it.get("title") or "").strip().replace("\n", " ")
+                    project = it.get("project") or ""
+                    user_text += f"- {title}"
+                    if tid:
+                        user_text += f" (#{tid})"
+                    if project:
+                        user_text += f" [{project}]"
+                    user_text += "\n"
+
+        user_text += "\nFULL_SUMMARY_JSON:\n" + summary_json
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            "temperature": 0.9,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": os.environ.get("OPENROUTER_SITE_URL", "http://localhost"),
+            "X-Title": os.environ.get("OPENROUTER_APP_NAME", "discord-palantir"),
+        }
+
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=60,
+        )
+        logger.debug("OpenRouter linear summary status=%s", resp.status_code)
+        if resp.status_code >= 400:
+            logger.warning("OpenRouter linear summary request failed: %s", resp.text[:400])
+            return _linear_summary_fallback_text(summary, flavor=flavor)
+
+        data = resp.json()
+        text = _extract_openrouter_choice_text(data)
+        if not text:
+            logger.warning("OpenRouter returned empty text for linear summary; using fallback.")
+            return _linear_summary_fallback_text(summary, flavor=flavor)
+
+        # Coerce to single-line output and keep below Discord's 2000-char message limit.
+        single = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        if len(single) > max_chars:
+            single = single[:max_chars].rsplit(" ", 1)[0].rstrip() + "..."
+
+        return single
+    except Exception as exc:
+        logger.exception("Exception while generating linear summary via OpenRouter: %s", exc)
+        return _linear_summary_fallback_text(summary, flavor=flavor)
 
 # Audio capture defaults (same keys/behavior as bot.py)
 AUDIO_CAPTURE_BACKEND = "arecord"
@@ -177,7 +776,7 @@ async def _palantir_audio_capture_and_send(channel_id: int, duration_s: int = 10
         if _client is None:
             logger.warning("Palantir audio helper: no client available to resolve channel %s", channel_id)
             return
-        channel = _client.get_channel(channel_id)
+        channel: Any = _client.get_channel(channel_id)
         if channel is None:
             try:
                 channel = await _client.fetch_channel(channel_id)
@@ -223,6 +822,83 @@ async def _palantir_audio_capture_and_send(channel_id: int, duration_s: int = 10
                 os.remove(tmp_path)
             except Exception:
                 logger.exception("Error removing temporary audio file: %s", tmp_path)
+
+
+async def _palantir_linear_summary_and_send(channel_id: int) -> None:
+    """Fire-and-forget helper: fetch Linear issues, compute metrics, and post a short audience-facing summary.
+
+    This helper is intentionally non-blocking for the /palantir command and logs but
+    swallows errors so it never interrupts the primary capture flow.
+    """
+    try:
+        # Respect env gating; default true
+        enabled_raw = os.environ.get(
+            "LINEAR_SUMMARY_ENABLED",
+            "true" if LINEAR_SUMMARY_ENABLED_DEFAULT else "false",
+        )
+        if str(enabled_raw).strip().lower() not in ("1", "true", "yes", "y", "on"):
+            logger.debug("Linear summary disabled by LINEAR_SUMMARY_ENABLED=%s", enabled_raw)
+            return
+
+        # Resolve client/channel early
+        if _client is None:
+            logger.warning("Palantir linear summary: no client available to resolve channel %s", channel_id)
+            return
+
+        channel: Any = _client.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await _client.fetch_channel(channel_id)
+            except discord.Forbidden:
+                logger.warning("Palantir linear summary: missing permission to fetch channel %s", channel_id)
+                return
+            except Exception as exc:
+                logger.exception("Palantir linear summary: failed to resolve channel %s: %s", channel_id, exc)
+                return
+
+        # Require LINEAR_API_KEY to actually fetch/post summaries. If missing, do nothing.
+        if not os.environ.get("LINEAR_API_KEY"):
+            logger.debug("LINEAR_API_KEY not set; skipping linear summary post.")
+            return
+
+        # Use env-configured defaults for statuses and lookahead
+        statuses, lookahead_days = _get_linear_env_defaults()
+
+        # Fetch data in a thread to avoid blocking the event loop
+        try:
+            raw_nodes = await asyncio.to_thread(fetch_linear_issues, statuses, lookahead_days)
+        except Exception as exc:
+            logger.warning("Palantir linear summary: failed to fetch Linear issues: %s", exc)
+            raw_nodes = []
+
+        # Compute summary metrics (fast/sync)
+        try:
+            summary = compute_linear_summary(raw_nodes, lookahead_days)
+        except Exception as exc:
+            logger.exception("Palantir linear summary: failed to compute summary metrics: %s", exc)
+            summary = {"counts": {}, "items": {}, "meta": {"lookahead_days": lookahead_days}}
+
+        # Ask OpenRouter/Grok to produce a short stylized summary. Run in thread.
+        try:
+            text = await asyncio.to_thread(_openrouter_linear_summary, summary)
+        except Exception as exc:
+            logger.exception("Palantir linear summary: OpenRouter summary generation failed: %s", exc)
+            text = _linear_summary_fallback_text(summary)
+
+        if not text:
+            text = _linear_summary_fallback_text(summary)
+
+        # Final send to channel with robust error handling; do not raise.
+        try:
+            await cast(Any, channel).send(text)
+        except discord.Forbidden:
+            logger.warning("Palantir linear summary: missing permission to post in channel %s", channel_id)
+        except discord.HTTPException as exc:
+            logger.exception("Palantir linear summary: HTTP error sending to channel %s: %s", channel_id, exc)
+        except Exception as exc:
+            logger.exception("Palantir linear summary: unexpected error sending to channel %s: %s", channel_id, exc)
+    except Exception as exc:
+        logger.exception("Unhandled error in palantir linear summary helper: %s", exc)
 
 
 def _read_stable_frame(cap: "cv2.VideoCapture", warmup_reads: int = 10, delay_s: float = 0.05):
@@ -299,11 +975,7 @@ def _configure_hdmi_capture(cap: "cv2.VideoCapture"):
     except Exception:
         pass
 
-    try:
-        mjpg = cv2.VideoWriter_fourcc(*"MJPG")
-        cap.set(cv2.CAP_PROP_FOURCC, mjpg)
-    except Exception:
-        pass
+    # Keep FOURCC tuning best-effort disabled for static-type compatibility.
 
     preferred_modes = [
         (1920, 1080),
@@ -567,6 +1239,10 @@ def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -
                         asyncio.create_task(heart_rate.send_palantir_heart_rate(channel_id))
                 except Exception:
                     logger.exception("Failed to create background task for palantir heart-rate helper")
+                try:
+                    asyncio.create_task(_palantir_linear_summary_and_send(channel_id))
+                except Exception:
+                    logger.exception("Failed to create background task for palantir linear summary helper")
         except Exception:
             logger.exception("Unexpected error scheduling palantir background helpers")
 

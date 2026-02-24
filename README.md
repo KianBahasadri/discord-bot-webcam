@@ -13,6 +13,11 @@ Environment
 - Optional shared OpenRouter headers:
   `OPENROUTER_SITE_URL` (default `http://localhost`),
   `OPENROUTER_APP_NAME` (default is feature-specific if unset)
+ - Optional Linear integration (audience-facing roast/recap shown once per /palantir):
+   `LINEAR_API_KEY` (personal Linear API key; required to enable summaries)
+   `LINEAR_SUMMARY_ENABLED` (default `true`; set to `false` to disable the summary)
+   `LINEAR_STATUSES` (comma-separated status names; default `In Progress,Todo`)
+   `LINEAR_LOOKAHEAD_DAYS` (integer days to look ahead for upcoming due dates; default `3`)
 - Optional `/palantir` capture/audio tuning env vars:
   `WEBCAM_AUDIO_DEVICE` (default `plughw:CARD=Device,DEV=0`),
   `WEBCAM_AUDIO_DURATION_SECONDS` (default `10`),
@@ -59,6 +64,7 @@ Notes
 - The bot uses opencv-python-headless to capture a single frame and sends it as a JPEG with no caption.
 - `/palantir` captures from `/dev/video0` (laptop webcam), attempts a remote webcam capture over SSH, and captures from `/dev/video2` (HDMI capture card).
 - `/palantir` also sends a standalone heart-rate message (for example `❤️ Heart rate: 72 bpm`) when `HEART_RATE_DEVICE_ADDRESS` is configured.
+ - `/palantir` now also optionally posts a short Linear status recap to the same channel when `LINEAR_API_KEY` is configured. This summary is audience-facing (for friends) and intentionally stylized — it may include a frustrated tone and light profanity when numeric facts indicate poor performance. Disable with `LINEAR_SUMMARY_ENABLED=false`.
 - `/palantir` redacts each captured image before upload by blurring detected explicit content and visible PII (for example: phone numbers, API keys/tokens, and credit card numbers).
 - `/ragebait-mo` runs in-channel multi-turn chat mode using OpenRouter and stops when the model marks the conversation off-topic.
 - `/ragebait-mo` loads Mo beliefs from `mo_beliefs.json` (host-mounted). The model can emit optional `belief_updates` in JSON output; new beliefs are appended to this file automatically.
