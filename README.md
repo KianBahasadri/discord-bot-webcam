@@ -8,6 +8,7 @@ Requirements
 Environment
 - Create a `.env` file in the project root with at least:
   `DISCORD_TOKEN=your_bot_token_here`
+  `ALLOWED_GUILD_IDS=1300638017731563613,1151470261145702400` (required: comma-separated guild IDs)
 - For OpenRouter-backed features (`/palantir` redaction and `/ragebait-mo`), also set:
   `OPENROUTER_API_KEY`
 - Optional shared OpenRouter headers:
@@ -60,7 +61,7 @@ OR use docker-compose (it injects variables from `.env` into the container). The
    docker compose up --build
 
 Notes
-- The bot registers global slash commands on startup (`/palantir`, `/ragebait-mo`). It may take a few minutes to appear in all guilds.
+- The bot registers slash commands only in guilds listed by `ALLOWED_GUILD_IDS`.
 - The bot uses opencv-python-headless to capture a single frame and sends it as a JPEG with no caption.
 - `/palantir` captures from `/dev/video0` (laptop webcam), attempts a remote webcam capture over SSH, and captures from `/dev/video2` (HDMI capture card).
 - `/palantir` also sends a standalone heart-rate message (for example `❤️ Heart rate: 72 bpm`) when `HEART_RATE_DEVICE_ADDRESS` is configured.

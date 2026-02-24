@@ -644,7 +644,11 @@ async def _read_channel_history(channel: Any, limit: int) -> list[Any]:
     return out
 
 
-def register(tree: discord.app_commands.CommandTree, client: discord.Client) -> None:
+def register(
+    tree: discord.app_commands.CommandTree,
+    client: discord.Client,
+    allowed_guilds: tuple[discord.Object, ...] | None = None,
+) -> None:
     """Register the /ragebait-mo slash command on the provided CommandTree and keep a reference to client.
 
     This mirrors the original decorator-based registration in bot.py but defers it to an explicit call.

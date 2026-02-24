@@ -14,7 +14,7 @@ import sys
 import asyncio
 import logging
 import subprocess
-from typing import Any
+from typing import Any, cast
 
 import discord
 from discord import app_commands
@@ -27,6 +27,32 @@ from commands import heart_rate as heart_rate_cmd
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+
+ALLOWED_GUILD_IDS_ENV = "ALLOWED_GUILD_IDS"
+UNAUTHORIZED_GUILD_MESSAGE = "This bot is restricted to authorized guilds only."
+
+
+def _load_allowed_guild_ids() -> set[int]:
+    raw = os.environ.get(ALLOWED_GUILD_IDS_ENV, "")
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        logger.error("%s must be set to a comma-separated list of Discord guild IDs.", ALLOWED_GUILD_IDS_ENV)
+        print(f"Error: {ALLOWED_GUILD_IDS_ENV} environment variable not set.", file=sys.stderr)
+        sys.exit(1)
+
+    guild_ids: set[int] = set()
+    for part in parts:
+        if not part.isdigit():
+            logger.error("Invalid guild id '%s' in %s; expected numeric snowflakes.", part, ALLOWED_GUILD_IDS_ENV)
+            print(f"Error: invalid guild id '{part}' in {ALLOWED_GUILD_IDS_ENV}.", file=sys.stderr)
+            sys.exit(1)
+        guild_ids.add(int(part))
+
+    return guild_ids
+
+
+ALLOWED_GUILD_IDS = _load_allowed_guild_ids()
+ALLOWED_GUILDS = tuple(discord.Object(id=guild_id) for guild_id in ALLOWED_GUILD_IDS)
 
 # Preserve audio startup behavior constants used by the original bot.
 AUDIO_CAPTURE_DEVICE_ENV = "WEBCAM_AUDIO_DEVICE"
@@ -81,6 +107,7 @@ if not DISCORD_TOKEN:
     logger.error("DISCORD_TOKEN not set. Exiting.")
     print("Error: DISCORD_TOKEN environment variable not set.", file=sys.stderr)
     sys.exit(1)
+assert DISCORD_TOKEN is not None
 
 
 class CamBot(discord.Client):
@@ -88,7 +115,7 @@ class CamBot(discord.Client):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(intents=intents)
-        self.tree = app_commands.CommandTree(self)
+        self.tree = RestrictedCommandTree(self)
 
     async def setup_hook(self) -> None:
         # Preserve startup audio gain behavior from original bot.
@@ -103,17 +130,27 @@ class CamBot(discord.Client):
 
         # Register command modules. Each module should expose register(tree, client).
         try:
-            palantir_cmd.register(self.tree, self)
-            delete_cmd.register(self.tree, self)
-            ragebait_cmd.register(self.tree, self)
+            palantir_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
+            delete_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
+            ragebait_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
         except Exception:
             logger.exception("Failed to register command modules")
 
-        # Sync global command tree on startup
+        # Copy registered global commands into authorized guild scopes.
+        for guild in ALLOWED_GUILDS:
+            self.tree.copy_global_to(guild=guild)
+
+        # Ensure commands are only visible in authorized guilds.
+        self.tree.clear_commands(guild=None)
         await self.tree.sync()
-        logger.info("Command tree synced.")
+        for guild in ALLOWED_GUILDS:
+            await self.tree.sync(guild=guild)
+        logger.info("Command tree synced to allowed guilds: %s", sorted(ALLOWED_GUILD_IDS))
 
     async def on_message(self, message: discord.Message) -> None:
+        if not _is_allowed_guild_id(getattr(message, "guild_id", None)):
+            return
+
         # Delegate per-message handling to ragebait_mo.handle_message
         try:
             await ragebait_cmd.handle_message(message)
@@ -122,10 +159,29 @@ class CamBot(discord.Client):
             logger.exception("Error in ragebait_mo.handle_message")
 
 
+def _is_allowed_guild_id(guild_id: int | None) -> bool:
+    return guild_id in ALLOWED_GUILD_IDS
+
+
+class RestrictedCommandTree(app_commands.CommandTree):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if _is_allowed_guild_id(getattr(interaction, "guild_id", None)):
+            return True
+
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(UNAUTHORIZED_GUILD_MESSAGE, ephemeral=True)
+            else:
+                await interaction.response.send_message(UNAUTHORIZED_GUILD_MESSAGE, ephemeral=True)
+        except Exception:
+            logger.warning("Failed to send unauthorized guild response for interaction %s", interaction.id)
+        return False
+
+
 def main() -> None:
     client = CamBot()
     try:
-        client.run(DISCORD_TOKEN)
+        client.run(cast(str, DISCORD_TOKEN))
     except Exception:
         logger.exception("Bot terminated unexpectedly.")
         sys.exit(1)

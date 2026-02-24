@@ -70,14 +70,21 @@ async def _delete_most_recent_bot_message(
         return {"deleted": False, "message_id": None, "content": "", "error": str(exc)}
 
 
-def register(tree: discord.app_commands.CommandTree, client: discord.Client) -> None:
+def register(
+    tree: discord.app_commands.CommandTree,
+    client: discord.Client,
+    allowed_guilds: tuple[discord.Object, ...] | None = None,
+) -> None:
     """Register the /delete slash command on the provided CommandTree.
 
     The registered handler uses the provided client for operations (so callers
     should pass the running discord.Client instance).
     """
 
-    @tree.command(name="delete", description="Delete the most recent bot-authored message in this channel")
+    @tree.command(
+        name="delete",
+        description="Delete the most recent bot-authored message in this channel",
+    )
     async def delete(interaction: discord.Interaction):
         """Slash command handler: delete the most recent bot message in the same channel.
 

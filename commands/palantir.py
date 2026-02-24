@@ -127,6 +127,41 @@ def _issue_node_key(node: Dict) -> str:
     return f"fallback:{title}:{updated_at}"
 
 
+def _is_closed_issue_node(node: Dict) -> bool:
+    state = node.get("state") or {}
+    state_type = str(state.get("type") or "").strip().lower()
+    state_name = str(state.get("name") or "").strip().lower()
+    closed_types = {"completed", "canceled", "cancelled"}
+    closed_names = {"done", "completed", "canceled", "cancelled"}
+    return (state_type in closed_types) or (state_name in closed_names)
+
+
+def _filter_closed_issues(nodes: List[Dict], now: Optional[datetime] = None, recent_closed_days: int = 7) -> List[Dict]:
+    """Keep open issues and only recently closed issues.
+
+    Closed issues are kept only if their completion/cancellation timestamp is
+    within the last `recent_closed_days` days.
+    """
+    if not nodes:
+        return []
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=max(0, int(recent_closed_days)))
+
+    filtered: List[Dict] = []
+    for node in nodes:
+        if not _is_closed_issue_node(node):
+            filtered.append(node)
+            continue
+
+        closed_at = _parse_iso_datetime(node.get("completedAt")) or _parse_iso_datetime(node.get("updatedAt"))
+        if closed_at and closed_at >= cutoff:
+            filtered.append(node)
+
+    return filtered
+
+
 def _node_to_issue(node: Dict) -> LinearIssue:
     return LinearIssue(
         identifier=node.get("identifier"),
@@ -262,14 +297,14 @@ query Issues($first: Int, $after: String) {{
                 total_retrieved += 1
                 if total_retrieved >= max_total:
                     logger.warning("Reached max_total (%s) while fetching Linear issues; truncating results.", max_total)
-                    return issues
+                    return _filter_closed_issues(issues, now=now)
 
             page_info = data.get("data", {}).get("issues", {}).get("pageInfo", {})
             if not page_info.get("hasNextPage"):
                 break
             after = page_info.get("endCursor")
 
-        return issues
+        return _filter_closed_issues(issues, now=now)
 
     except LinearFetchError as exc:
         logger.warning("Primary Linear fetch failed (%s). Attempting fallback fetch methods.", exc)
@@ -312,7 +347,7 @@ query IssuesByDue($first: Int, $after: String) {{
                         total_retrieved += 1
                         if total_retrieved >= max_total:
                             logger.warning("Reached max_total (%s) during fallback fetch; truncating results.", max_total)
-                            return list(merged_issues.values())
+                            return _filter_closed_issues(list(merged_issues.values()), now=now)
                 page_info = data.get("data", {}).get("issues", {}).get("pageInfo", {})
                 if not page_info.get("hasNextPage"):
                     break
@@ -335,13 +370,13 @@ query IssuesByDue($first: Int, $after: String) {{
                         total_retrieved += 1
                         if total_retrieved >= max_total:
                             logger.warning("Reached max_total (%s) during due-date fallback; truncating results.", max_total)
-                            return list(merged_issues.values())
+                            return _filter_closed_issues(list(merged_issues.values()), now=now)
                 page_info = data.get("data", {}).get("issues", {}).get("pageInfo", {})
                 if not page_info.get("hasNextPage"):
                     break
                 after = page_info.get("endCursor")
 
-            return list(merged_issues.values())
+            return _filter_closed_issues(list(merged_issues.values()), now=now)
         except LinearFetchError as exc2:
             logger.warning("State-only fallback failed: %s", exc2)
             # Final fallback: fetch without server-side filter and filter client-side (bounded)
@@ -389,7 +424,7 @@ query AllIssues($first: Int, $after: String) {
                     due = _parse_iso_datetime(n.get("dueDate"))
                     if (state_name in resolved_statuses) or (due is not None and due <= due_limit):
                         filtered.append(n)
-                return filtered
+                return _filter_closed_issues(filtered, now=now)
             except LinearFetchError as final_exc:
                 raise LinearFetchError(f"All Linear fetch attempts failed: {final_exc}")
     finally:
@@ -1201,7 +1236,11 @@ async def _run_redaction_job(name: str, path: str, timeout_s: int) -> dict:
         return {"name": name, "path": None, "error": msg, "metadata": None}
 
 
-def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -> None:
+def register(
+    tree: "discord.app_commands.CommandTree",
+    client: discord.Client,
+    allowed_guilds: tuple[discord.Object, ...] | None = None,
+) -> None:
     """Register the /palantir command on the provided CommandTree and bind the client.
 
     The registered handler mirrors the behavior from bot.py. Helper functions in
