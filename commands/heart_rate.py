@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Background BLE heart-rate monitor and /webcam message helper."""
+"""Background BLE heart-rate monitor and /palantir message helper."""
 
 from __future__ import annotations
 
@@ -150,7 +150,7 @@ def get_snapshot() -> HeartRateSnapshot:
     )
 
 
-def format_webcam_message() -> str:
+def format_palantir_message() -> str:
     snapshot = get_snapshot()
     if snapshot.available and snapshot.bpm is not None:
         return f"{HEART_RATE_EMOJI} Heart rate: {snapshot.bpm} bpm"
@@ -292,8 +292,8 @@ async def start_background_monitor() -> None:
     logger.info("Heart-rate monitor background task started for %s.", target_address)
 
 
-async def send_webcam_heart_rate(channel_id: int) -> None:
-    """Send a standalone heart-rate message to the channel used by /webcam."""
+async def send_palantir_heart_rate(channel_id: int) -> None:
+    """Send a standalone heart-rate message to the channel used by /palantir."""
     channel: Any = None
     try:
         if not is_enabled():
@@ -315,7 +315,7 @@ async def send_webcam_heart_rate(channel_id: int) -> None:
             return
 
         await _wait_for_recent_reading(HEART_RATE_MESSAGE_WAIT_SECONDS)
-        await channel.send(format_webcam_message())
+        await channel.send(format_palantir_message())
     except discord.Forbidden:
         logger.warning("Heart-rate helper: missing permission to post in channel %s.", channel_id)
     except Exception as exc:

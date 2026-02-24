@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Command module for the /webcam slash command.
+Command module for the /palantir slash command.
 
 Exposes register(tree, client) which registers the command on the provided
 app_commands CommandTree and wires the client instance the command uses.
@@ -159,12 +159,12 @@ def _capture_local_audio_to_tempfile(duration_s: int = 10) -> str:
         raise
 
 
-async def _webcam_audio_capture_and_send(channel_id: int, duration_s: int = 10) -> None:
+async def _palantir_audio_capture_and_send(channel_id: int, duration_s: int = 10) -> None:
     """Fire-and-forget helper: record microphone for duration_s and send file to channel.
 
     This helper logs exceptions and attempts to post concise error messages in the
     same channel when failures occur. It intentionally returns None and is meant to be
-    scheduled with asyncio.create_task(...) from the /webcam handler.
+    scheduled with asyncio.create_task(...) from the /palantir handler.
     """
     channel: Any = None
     tmp_path = None
@@ -175,7 +175,7 @@ async def _webcam_audio_capture_and_send(channel_id: int, duration_s: int = 10) 
     try:
         # Resolve channel (try cache first, then REST fetch)
         if _client is None:
-            logger.warning("Webcam audio helper: no client available to resolve channel %s", channel_id)
+            logger.warning("Palantir audio helper: no client available to resolve channel %s", channel_id)
             return
         channel = _client.get_channel(channel_id)
         if channel is None:
@@ -185,7 +185,7 @@ async def _webcam_audio_capture_and_send(channel_id: int, duration_s: int = 10) 
                 channel = None
 
         if channel is None:
-            logger.warning("Webcam audio helper: could not resolve channel id %s", channel_id)
+            logger.warning("Palantir audio helper: could not resolve channel id %s", channel_id)
             return
 
         # Run blocking capture in a thread to avoid blocking the event loop
@@ -197,26 +197,26 @@ async def _webcam_audio_capture_and_send(channel_id: int, duration_s: int = 10) 
         except discord.Forbidden:
             # Bot cannot post in channel
             try:
-                await channel.send("Failed to send webcam audio: missing permission to post messages here.")
+                await channel.send("Failed to send palantir audio: missing permission to post messages here.")
             except Exception:
                 logger.exception("Failed to report audio send permission error to channel %s", channel_id)
         except Exception as exc:
-            logger.exception("Failed to send webcam audio to channel %s: %s", channel_id, exc)
+            logger.exception("Failed to send palantir audio to channel %s: %s", channel_id, exc)
             try:
-                await channel.send(f"Failed to send webcam audio: {exc}")
+                await channel.send(f"Failed to send palantir audio: {exc}")
             except Exception:
                 logger.exception("Failed to deliver audio error message to channel %s", channel_id)
 
     except Exception as exc:
-        logger.exception("Unhandled error in webcam audio helper: %s", exc)
+        logger.exception("Unhandled error in palantir audio helper: %s", exc)
         # Try to post a brief error message in the same channel
         try:
             if channel is None and _client is not None:
                 channel = _client.get_channel(channel_id)
             if channel is not None:
-                await channel.send(f"Webcam audio capture failed: {exc}")
+                await channel.send(f"Palantir audio capture failed: {exc}")
         except Exception:
-            logger.exception("Failed to report webcam audio helper error to channel %s", channel_id)
+            logger.exception("Failed to report palantir audio helper error to channel %s", channel_id)
     finally:
         if tmp_path:
             try:
@@ -503,7 +503,7 @@ async def _run_capture_job(name: str, capture_fn: Callable[[], str], timeout_s: 
     except asyncio.TimeoutError:
         return {"name": name, "path": None, "error": f"{name} capture timed out after {timeout_s}s."}
     except Exception as exc:
-        logger.warning("%s capture failed for /webcam: %s", name, exc)
+        logger.warning("%s capture failed for /palantir: %s", name, exc)
         msg = str(exc).strip() or f"{name} capture failed."
         return {"name": name, "path": None, "error": msg}
 
@@ -524,13 +524,13 @@ async def _run_redaction_job(name: str, path: str, timeout_s: int) -> dict:
             "metadata": None,
         }
     except Exception as exc:
-        logger.warning("%s redaction failed for /webcam: %s", name, exc)
+        logger.warning("%s redaction failed for /palantir: %s", name, exc)
         msg = str(exc).strip() or f"{name} redaction failed."
         return {"name": name, "path": None, "error": msg, "metadata": None}
 
 
 def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -> None:
-    """Register the /webcam command on the provided CommandTree and bind the client.
+    """Register the /palantir command on the provided CommandTree and bind the client.
 
     The registered handler mirrors the behavior from bot.py. Helper functions in
     this module are intentionally private (leading underscore).
@@ -538,11 +538,11 @@ def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -
     global _client
     _client = client
 
-    @tree.command(name="webcam", description="idek wtf im doing anymore")
-    async def webcam(interaction: discord.Interaction):
+    @tree.command(name="palantir", description="idek wtf im doing anymore")
+    async def palantir(interaction: discord.Interaction):
         """Slash command handler: capture local webcam, remote webcam, and HDMI screenshot."""
         await interaction.response.defer()
-        # Trigger fire-and-forget helpers exactly once per /webcam invocation.
+        # Trigger fire-and-forget helpers exactly once per /palantir invocation.
         try:
             channel_id = None
             interaction_channel = getattr(interaction, "channel", None)
@@ -559,16 +559,16 @@ def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -
                     duration = 10
                 # Schedule non-blocking fire-and-forget task
                 try:
-                    asyncio.create_task(_webcam_audio_capture_and_send(channel_id, duration_s=duration))
+                    asyncio.create_task(_palantir_audio_capture_and_send(channel_id, duration_s=duration))
                 except Exception:
-                    logger.exception("Failed to create background task for webcam audio helper")
+                    logger.exception("Failed to create background task for palantir audio helper")
                 try:
                     if heart_rate.is_enabled():
-                        asyncio.create_task(heart_rate.send_webcam_heart_rate(channel_id))
+                        asyncio.create_task(heart_rate.send_palantir_heart_rate(channel_id))
                 except Exception:
-                    logger.exception("Failed to create background task for webcam heart-rate helper")
+                    logger.exception("Failed to create background task for palantir heart-rate helper")
         except Exception:
-            logger.exception("Unexpected error scheduling webcam background helpers")
+            logger.exception("Unexpected error scheduling palantir background helpers")
 
         tmp_paths = []
         try:
@@ -615,7 +615,7 @@ def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -
                         notes.append(f"{redaction_result.get('name', 'Capture')}: full-frame blur fallback applied.")
 
             if not files and errors:
-                await interaction.followup.send("Webcam captures failed:\n" + "\n".join(f"- {err}" for err in errors))
+                await interaction.followup.send("Palantir captures failed:\n" + "\n".join(f"- {err}" for err in errors))
                 return
 
             content = None
@@ -637,7 +637,7 @@ def register(tree: "discord.app_commands.CommandTree", client: discord.Client) -
                 await interaction.followup.send(content or "No captures produced output.")
 
         except Exception as exc:
-            logger.exception("Error during /webcam")
+            logger.exception("Error during /palantir")
             # Attempt to send an ephemeral error message to the user
             try:
                 await interaction.followup.send(f"Error capturing image: {exc}", ephemeral=True)

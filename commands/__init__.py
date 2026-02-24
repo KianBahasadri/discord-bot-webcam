@@ -6,4 +6,4 @@ package is imported. Individual command modules are imported directly by bot.py
 during startup and registered via their register(tree, client) function.
 """
 
-__all__ = ["webcam", "delete", "ragebait_mo", "heart_rate"]
+__all__ = ["palantir", "delete", "ragebait_mo", "heart_rate"]

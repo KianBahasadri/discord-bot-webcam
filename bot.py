@@ -20,7 +20,7 @@ import discord
 from discord import app_commands
 
 # Import command modules. These modules expose register(tree, client).
-from commands import webcam as webcam_cmd
+from commands import palantir as palantir_cmd
 from commands import delete as delete_cmd
 from commands import ragebait_mo as ragebait_cmd
 from commands import heart_rate as heart_rate_cmd
@@ -103,7 +103,7 @@ class CamBot(discord.Client):
 
         # Register command modules. Each module should expose register(tree, client).
         try:
-            webcam_cmd.register(self.tree, self)
+            palantir_cmd.register(self.tree, self)
             delete_cmd.register(self.tree, self)
             ragebait_cmd.register(self.tree, self)
         except Exception:
