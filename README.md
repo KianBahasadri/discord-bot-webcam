@@ -9,6 +9,7 @@ Environment
 - Create a `.env` file in the project root with at least:
   `DISCORD_TOKEN=your_bot_token_here`
   `ALLOWED_GUILD_IDS=1300638017731563613,1151470261145702400` (required: comma-separated guild IDs)
+  `CLOUDFLARED_TUNNEL_TOKEN=...` (optional; enables `cloudflared` sidecar in compose)
 - For OpenRouter-backed features (`/palantir` redaction and `/ragebait-mo`), also set:
   `OPENROUTER_API_KEY`
 - Optional shared OpenRouter headers:
@@ -31,6 +32,12 @@ Environment
   `REMOTE_WEBCAM_WARMUP_FPS` (default `15`),
   `REMOTE_WEBCAM_SETTLE_SECONDS` (default `0.4`),
   `HEART_RATE_DEVICE_ADDRESS` (for `/palantir` heart-rate side message; example `F8:AF:75:80:4A:48`)
+- Optional OwnTracks ingest env vars:
+  `OWNTRACKS_BIND_HOST` (default `127.0.0.1`; compose overrides to `0.0.0.0` for sidecar access),
+  `OWNTRACKS_BIND_PORT` (default `8787`),
+  `OWNTRACKS_DB_PATH` (default `./opentracks.db`)
+- Optional reminder-only var:
+  `OWNTRACKS_PUBLIC_ENDPOINT` (ignored by bot; useful as a note for your tokenized public URI)
 - Required `/palantir` redaction model env var:
   `OPENROUTER_REDACTION_MODEL` (required; example `google/gemini-2.5-flash`),
   `WEBCAM_REDACTION_TIMEOUT_SECONDS` (default `30`),
@@ -59,6 +66,16 @@ Build and run with Docker
 
 OR use docker-compose (it injects variables from `.env` into the container). The included docker-compose file maps /dev/video0, /dev/video2, /dev/snd, `/run/dbus/system_bus_socket`, and `./mo_beliefs.json:/app/mo_beliefs.json`:
    docker compose up --build
+
+OwnTracks ingest
+
+- The bot starts an aiohttp server with:
+  - `GET /healthz`
+  - `POST` on any path (so Cloudflare can forward tokenized paths without origin path rewrite)
+- `OWNTRACKS_PUBLIC_ENDPOINT` is intentionally ignored in app code; cloudflared/Cloudflare handles public URI routing.
+- The endpoint accepts intermittent OwnTracks HTTP payloads, ignores zero-length bodies with `204`, queues valid JSON payloads, and persists events to SQLite.
+- Location payloads (`_type=location`) are normalized into `owntracks_points`; all payloads are stored in `owntracks_events` in `opentracks.db`.
+- In Docker Compose, `cloudflared` runs as a sidecar and the bot binds to `0.0.0.0:8787` on the internal network only (no host port published).
 
 Notes
 - The bot registers slash commands only in guilds listed by `ALLOWED_GUILD_IDS`.

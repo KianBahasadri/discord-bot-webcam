@@ -3,11 +3,25 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      OWNTRACKS_BIND_HOST: 0.0.0.0
+      OWNTRACKS_BIND_PORT: 8787
+      OWNTRACKS_DB_PATH: /app/opentracks.db
     devices:
       - "/dev/video0:/dev/video0"
       - "/dev/video2:/dev/video2"
       - "/dev/snd:/dev/snd"
     volumes:
       - "./mo_beliefs.json:/app/mo_beliefs.json"
+      - "./opentracks.db:/app/opentracks.db"
       - "/run/dbus/system_bus_socket:/run/dbus/system_bus_socket"
+    restart: always
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    env_file:
+      - .env
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARED_TUNNEL_TOKEN}
+    depends_on:
+      - cam-bot
     restart: always

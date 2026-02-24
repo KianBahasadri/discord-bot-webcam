@@ -7,3 +7,5 @@ venv/
 .pytest_cache/
 mo_beliefs*.json
 state/
+opentracks.db
+opentracks.db-*
