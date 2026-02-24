@@ -16,9 +16,11 @@ import tempfile
 import logging
 import re
 import time
+import sqlite3
 import subprocess
 import shlex
 import shutil
+from pathlib import Path
 from typing import Any, Callable, Optional, cast
 import json
 from dataclasses import dataclass
@@ -49,6 +51,8 @@ LINEAR_GRAPHQL_ENDPOINT = os.environ.get("LINEAR_GRAPHQL_ENDPOINT", "https://api
 LINEAR_SUMMARY_ENABLED_DEFAULT = True
 LINEAR_DEFAULT_STATUSES = ["In Progress", "Todo"]
 LINEAR_DEFAULT_LOOKAHEAD_DAYS = 3
+OWNTRACKS_DB_PATH_ENV = "OWNTRACKS_DB_PATH"
+OWNTRACKS_DB_PATH_DEFAULT = "./opentracks.db"
 
 
 class LinearError(Exception):
@@ -936,6 +940,83 @@ async def _palantir_linear_summary_and_send(channel_id: int) -> None:
         logger.exception("Unhandled error in palantir linear summary helper: %s", exc)
 
 
+def _fetch_last_known_location() -> tuple[float, float, int | None] | None:
+    """Return the most recent (longitude, latitude, received_at) from OwnTracks storage."""
+    db_path = Path(os.environ.get(OWNTRACKS_DB_PATH_ENV, OWNTRACKS_DB_PATH_DEFAULT)).expanduser()
+    if not db_path.exists():
+        return None
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT lon, lat, received_at
+            FROM owntracks_points
+            ORDER BY COALESCE(tst, received_at) DESC, id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    try:
+        lon = float(row[0])
+        lat = float(row[1])
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        received_at = int(row[2]) if row[2] is not None else None
+    except (TypeError, ValueError):
+        received_at = None
+
+    return lon, lat, received_at
+
+
+async def _palantir_location_and_send(channel_id: int) -> None:
+    """Fire-and-forget helper: send last known OwnTracks location to channel."""
+    try:
+        if _client is None:
+            logger.warning("Palantir location helper: no client available to resolve channel %s", channel_id)
+            return
+
+        channel: Any = _client.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await _client.fetch_channel(channel_id)
+            except discord.Forbidden:
+                logger.warning("Palantir location helper: missing permission to fetch channel %s", channel_id)
+                return
+            except Exception as exc:
+                logger.exception("Palantir location helper: failed to resolve channel %s: %s", channel_id, exc)
+                return
+
+        location = await asyncio.to_thread(_fetch_last_known_location)
+        if location is None:
+            text = "Last known location: unavailable"
+        else:
+            lon, lat, received_at = location
+            if received_at is None:
+                text = f"Last known location: longitude {lon:.6f}, latitude {lat:.6f}"
+            else:
+                added_at = datetime.fromtimestamp(received_at, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                text = (
+                    f"Last known location: longitude {lon:.6f}, latitude {lat:.6f} "
+                    f"(added to DB: {added_at})"
+                )
+
+        try:
+            await cast(Any, channel).send(text)
+        except discord.Forbidden:
+            logger.warning("Palantir location helper: missing permission to post in channel %s", channel_id)
+        except discord.HTTPException as exc:
+            logger.exception("Palantir location helper: HTTP error sending to channel %s: %s", channel_id, exc)
+        except Exception as exc:
+            logger.exception("Palantir location helper: unexpected error sending to channel %s: %s", channel_id, exc)
+    except Exception as exc:
+        logger.exception("Unhandled error in palantir location helper: %s", exc)
+
+
 def _read_stable_frame(cap: "cv2.VideoCapture", warmup_reads: int = 10, delay_s: float = 0.05):
     """Read a usable frame, skipping initial green placeholder frames some devices emit."""
     last_frame = None
@@ -1282,6 +1363,10 @@ def register(
                     asyncio.create_task(_palantir_linear_summary_and_send(channel_id))
                 except Exception:
                     logger.exception("Failed to create background task for palantir linear summary helper")
+                try:
+                    asyncio.create_task(_palantir_location_and_send(channel_id))
+                except Exception:
+                    logger.exception("Failed to create background task for palantir location helper")
         except Exception:
             logger.exception("Unexpected error scheduling palantir background helpers")
 
