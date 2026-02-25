@@ -35,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_GUILD_IDS_ENV = "ALLOWED_GUILD_IDS"
 UNAUTHORIZED_GUILD_MESSAGE = "This bot is restricted to authorized guilds only."
+ENABLE_PALANTIR_COMMAND_ENV = "ENABLE_PALANTIR_COMMAND"
+ENABLE_DELETE_COMMAND_ENV = "ENABLE_DELETE_COMMAND"
+ENABLE_RAGEBAIT_MO_COMMAND_ENV = "ENABLE_RAGEBAIT_MO_COMMAND"
 
 
 def _load_allowed_guild_ids() -> set[int]:
@@ -90,6 +93,21 @@ def _load_int_env(name: str, default: int, *, minimum: int = 1) -> int:
         logger.warning("%s must be >= %d, using default %d", name, minimum, default)
         return default
     return value
+
+
+def _load_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+
+    value = raw.lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+
+    logger.warning("Invalid boolean for %s=%r, using default %s", name, raw, default)
+    return default
 
 
 class OwnTracksStore:
@@ -384,9 +402,20 @@ class CamBot(discord.Client):
 
         # Register command modules. Each module should expose register(tree, client).
         try:
-            palantir_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
-            delete_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
-            ragebait_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
+            if _load_bool_env(ENABLE_PALANTIR_COMMAND_ENV, True):
+                palantir_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
+            else:
+                logger.info("Skipping /palantir registration; %s disabled", ENABLE_PALANTIR_COMMAND_ENV)
+
+            if _load_bool_env(ENABLE_DELETE_COMMAND_ENV, True):
+                delete_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
+            else:
+                logger.info("Skipping /delete registration; %s disabled", ENABLE_DELETE_COMMAND_ENV)
+
+            if _load_bool_env(ENABLE_RAGEBAIT_MO_COMMAND_ENV, True):
+                ragebait_cmd.register(self.tree, self, allowed_guilds=ALLOWED_GUILDS)
+            else:
+                logger.info("Skipping /ragebait-mo registration; %s disabled", ENABLE_RAGEBAIT_MO_COMMAND_ENV)
         except Exception:
             logger.exception("Failed to register command modules")
 
